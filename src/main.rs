@@ -20,6 +20,13 @@ use ratatui::{
 use ropey::Rope;
 use serde::Deserialize;
 use tree_sitter_highlight::{Highlight, HighlightConfiguration, HighlightEvent, Highlighter};
+use ratatui_image::{
+    picker::Picker,
+    protocol::StatefulProtocol,
+    thread::{ThreadImage, ThreadProtocol},
+    Resize,
+};
+use std::sync::mpsc::{self, Receiver, Sender};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Language {
@@ -405,6 +412,20 @@ impl SyntaxHighlighter {
     }
 }
 
+fn is_image_file(path: &PathBuf) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()).as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp")
+    )
+}
+
+fn decode_image(path: &PathBuf) -> Option<image::DynamicImage> {
+    image::ImageReader::open(path)
+        .ok()?
+        .decode()
+        .ok()
+}
+
 struct App {
     root_dir: PathBuf,
     current_dir: PathBuf,
@@ -425,10 +446,23 @@ struct App {
     buffer_dirty: bool,
     // 行オフセットキャッシュ（バイト位置）
     line_offsets: Vec<usize>,
+    // 最大行幅キャッシュ（文字数）
+    max_line_width: usize,
     // カーソル追従を有効にするか
     follow_cursor: bool,
     // 現在のファイルの言語
     current_language: Option<Language>,
+    // 画像表示用
+    picker: Picker,
+    image_state: Option<ThreadProtocol>,
+    is_image_mode: bool,
+    image_loading: bool,
+    // 画像リサイズ用スレッド通信
+    image_tx: Sender<(StatefulProtocol, Resize, Rect)>,
+    image_rx: Receiver<StatefulProtocol>,
+    // 画像デコード用スレッド通信
+    decode_tx: Sender<(PathBuf, Picker, Sender<(StatefulProtocol, Resize, Rect)>)>,
+    decode_rx: Receiver<ThreadProtocol>,
 }
 
 impl App {
@@ -437,6 +471,42 @@ impl App {
         let root_dir = current_dir.clone();
         let entries = Self::read_dir(&current_dir);
         let config = Config::load();
+        let picker = Picker::from_query_stdio()
+            .unwrap_or_else(|_| Picker::from_fontsize((8, 12)));
+
+        // 画像リサイズ用のワーカースレッドを起動
+        let (tx_worker, rx_worker) = mpsc::channel::<(StatefulProtocol, Resize, Rect)>();
+        let (tx_main, rx_main) = mpsc::channel::<StatefulProtocol>();
+        std::thread::spawn(move || {
+            while let Ok((mut protocol, resize, area)) = rx_worker.recv() {
+                protocol.resize_encode(&resize, protocol.background_color(), area);
+                let _ = tx_main.send(protocol);
+            }
+        });
+
+        // 画像デコード用のワーカースレッドを起動
+        let (decode_tx, decode_rx_worker) = mpsc::channel::<(PathBuf, Picker, Sender<(StatefulProtocol, Resize, Rect)>)>();
+        let (decode_tx_main, decode_rx) = mpsc::channel::<ThreadProtocol>();
+        std::thread::spawn(move || {
+            while let Ok((path, picker, resize_tx)) = decode_rx_worker.recv() {
+                let dyn_img = decode_image(&path);
+                if let Some(dyn_img) = dyn_img {
+                    // 大きすぎる画像は事前に縮小
+                    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                    let max_width = (cols as u32) * 10;
+                    let max_height = (rows as u32) * 20;
+                    let img = if dyn_img.width() > max_width || dyn_img.height() > max_height {
+                        dyn_img.resize(max_width, max_height, image::imageops::FilterType::Nearest)
+                    } else {
+                        dyn_img
+                    };
+                    let protocol = picker.new_resize_protocol(img);
+                    let thread_protocol = ThreadProtocol::new(resize_tx, protocol);
+                    let _ = decode_tx_main.send(thread_protocol);
+                }
+            }
+        });
+
         App {
             root_dir,
             current_dir,
@@ -455,8 +525,17 @@ impl App {
             highlight_cache: None,
             buffer_dirty: false,
             line_offsets: Vec::new(),
+            max_line_width: 0,
             follow_cursor: true,
             current_language: None,
+            picker,
+            image_state: None,
+            is_image_mode: false,
+            image_loading: false,
+            image_tx: tx_worker,
+            image_rx: rx_main,
+            decode_tx,
+            decode_rx,
         }
     }
 
@@ -470,10 +549,27 @@ impl App {
 
     fn open_file(&mut self, path: &PathBuf) {
         if path.is_file() {
-            let content = fs::read_to_string(path).unwrap_or_else(|_| String::new());
-            self.buffer = Rope::from_str(&content);
             self.file_path = Some(path.clone());
-            self.current_language = self.syntax.detect_language(path);
+
+            if is_image_file(path) {
+                // 画像ファイルの場合 - 非同期でデコード
+                let _ = self.decode_tx.send((path.clone(), self.picker.clone(), self.image_tx.clone()));
+                self.image_state = None;
+                self.is_image_mode = true;
+                self.image_loading = true;
+                // テキストバッファはクリア
+                self.buffer = Rope::new();
+                self.current_language = None;
+            } else {
+                // テキストファイルの場合
+                let content = fs::read_to_string(path).unwrap_or_else(|_| String::new());
+                self.buffer = Rope::from_str(&content);
+                self.current_language = self.syntax.detect_language(path);
+                self.image_state = None;
+                self.is_image_mode = false;
+                self.image_loading = false;
+            }
+
             self.cursor_line = 0;
             self.cursor_col = 0;
             self.scroll_offset = 0;
@@ -481,6 +577,7 @@ impl App {
             self.source_cache.clear();
             self.highlight_cache = None;
             self.line_offsets.clear();
+            self.max_line_width = 0;
             self.buffer_dirty = true;
         }
     }
@@ -677,10 +774,15 @@ impl App {
 
     fn handle_editor_horizontal_scroll(&mut self, delta: i16) {
         self.follow_cursor = false; // マウススクロール中はカーソル追従を無効化
+        let visible_width = self.editor_area.width.saturating_sub(2) as usize;
+        let ln_width = self.line_number_width();
+        let content_width = visible_width.saturating_sub(ln_width);
+        let max_scroll = self.max_line_width.saturating_sub(content_width);
+
         if delta < 0 {
             self.horizontal_scroll = self.horizontal_scroll.saturating_sub((-delta) as usize);
         } else {
-            self.horizontal_scroll += delta as usize;
+            self.horizontal_scroll = (self.horizontal_scroll + delta as usize).min(max_scroll);
         }
     }
 
@@ -767,14 +869,23 @@ impl App {
             self.source_cache.push_str(chunk);
         }
 
-        // 行オフセットキャッシュを構築
+        // 行オフセットキャッシュを構築し、最大行幅を計算
         self.line_offsets.clear();
         self.line_offsets.push(0);
+        self.max_line_width = 0;
+        let mut current_line_chars = 0usize;
         for (i, byte) in self.source_cache.bytes().enumerate() {
             if byte == b'\n' {
+                self.max_line_width = self.max_line_width.max(current_line_chars);
                 self.line_offsets.push(i + 1);
+                current_line_chars = 0;
+            } else if (byte & 0b11000000) != 0b10000000 {
+                // UTF-8の先頭バイトのみカウント（継続バイトは除外）
+                current_line_chars += 1;
             }
         }
+        // 最終行（改行で終わらない場合）
+        self.max_line_width = self.max_line_width.max(current_line_chars);
 
         // ハイライトキャッシュを更新
         if let Some(lang) = self.current_language {
@@ -928,6 +1039,19 @@ fn main() -> io::Result<()> {
     let mut app = App::new();
 
     loop {
+        // 画像デコード完了イベントを受け取る
+        if let Ok(thread_protocol) = app.decode_rx.try_recv() {
+            app.image_state = Some(thread_protocol);
+            app.image_loading = false;
+        }
+
+        // 画像リサイズ完了イベントを受け取る
+        if let Ok(protocol) = app.image_rx.try_recv() {
+            if let Some(ref mut state) = app.image_state {
+                state.set_protocol(protocol);
+            }
+        }
+
         app.update_scroll();
 
         terminal.draw(|frame| {
@@ -1002,21 +1126,40 @@ fn main() -> io::Result<()> {
             frame.render_widget(sidebar, chunks[0]);
 
             // エディタ
-            let visible_height = chunks[1].height.saturating_sub(2) as usize;
-            let visible_width = chunks[1].width.saturating_sub(2) as usize;
-            let lines = app.get_highlighted_lines(visible_height, visible_width);
+            if app.is_image_mode {
+                // 画像モード
+                let block = Block::default()
+                    .title(format!("{} [Ctrl-C: Quit]", app.file_name()))
+                    .borders(Borders::ALL);
+                let inner = block.inner(chunks[1]);
+                frame.render_widget(block, chunks[1]);
 
-            let editor = Paragraph::new(lines)
-                .block(Block::default()
-                    .title(format!("{} [Ctrl-S: Save, Ctrl-C: Quit]", app.file_name()))
-                    .borders(Borders::ALL));
-            frame.render_widget(editor, chunks[1]);
+                if app.image_loading {
+                    // ローディング中
+                    let loading = Paragraph::new("Loading...");
+                    frame.render_widget(loading, inner);
+                } else if let Some(ref mut image_state) = app.image_state {
+                    let image_widget = ThreadImage::default();
+                    frame.render_stateful_widget(image_widget, inner, image_state);
+                }
+            } else {
+                // テキストモード
+                let visible_height = chunks[1].height.saturating_sub(2) as usize;
+                let visible_width = chunks[1].width.saturating_sub(2) as usize;
+                let lines = app.get_highlighted_lines(visible_height, visible_width);
 
-            // カーソル表示（行番号と横スクロールを考慮）
-            let ln_width = app.line_number_width() as u16;
-            let cursor_x = chunks[1].x + 1 + ln_width + app.cursor_col.saturating_sub(app.horizontal_scroll) as u16;
-            let cursor_y = chunks[1].y + 1 + app.cursor_line.saturating_sub(app.scroll_offset) as u16;
-            frame.set_cursor_position((cursor_x, cursor_y));
+                let editor = Paragraph::new(lines)
+                    .block(Block::default()
+                        .title(format!("{} [Ctrl-S: Save, Ctrl-C: Quit]", app.file_name()))
+                        .borders(Borders::ALL));
+                frame.render_widget(editor, chunks[1]);
+
+                // カーソル表示（行番号と横スクロールを考慮）
+                let ln_width = app.line_number_width() as u16;
+                let cursor_x = chunks[1].x + 1 + ln_width + app.cursor_col.saturating_sub(app.horizontal_scroll) as u16;
+                let cursor_y = chunks[1].y + 1 + app.cursor_line.saturating_sub(app.scroll_offset) as u16;
+                frame.set_cursor_position((cursor_x, cursor_y));
+            }
         })?;
 
         // イベントをバッチ処理（溜まっているイベントを全て処理してから描画）
@@ -1053,7 +1196,13 @@ fn main() -> io::Result<()> {
                     } else if key.modifiers.contains(KeyModifiers::ALT) {
                         match key.code {
                             KeyCode::Left => app.horizontal_scroll = app.horizontal_scroll.saturating_sub(5),
-                            KeyCode::Right => app.horizontal_scroll += 5,
+                            KeyCode::Right => {
+                                let visible_width = app.editor_area.width.saturating_sub(2) as usize;
+                                let ln_width = app.line_number_width();
+                                let content_width = visible_width.saturating_sub(ln_width);
+                                let max_scroll = app.max_line_width.saturating_sub(content_width);
+                                app.horizontal_scroll = (app.horizontal_scroll + 5).min(max_scroll);
+                            }
                             KeyCode::Up => app.scroll_offset = app.scroll_offset.saturating_sub(5),
                             KeyCode::Down => app.scroll_offset += 5,
                             _ => {}
