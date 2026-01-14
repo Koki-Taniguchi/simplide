@@ -601,6 +601,38 @@ impl App {
         }
     }
 
+    fn move_to_line_start(&mut self) {
+        self.follow_cursor = true;
+        self.cursor_col = 0;
+    }
+
+    fn move_to_line_end(&mut self) {
+        self.follow_cursor = true;
+        self.cursor_col = self.current_line_len();
+    }
+
+    fn kill_line(&mut self) {
+        self.follow_cursor = true;
+        let line_len = self.current_line_len();
+        if self.cursor_col >= line_len {
+            // カーソルが行末にある場合、改行を削除（次の行と結合）
+            let idx = self.cursor_char_idx();
+            if idx < self.buffer.len_chars() {
+                self.buffer.remove(idx..idx + 1);
+                self.buffer_dirty = true;
+            }
+        } else {
+            // カーソルから行末まで削除
+            let start_idx = self.cursor_char_idx();
+            let line_start = self.buffer.line_to_char(self.cursor_line);
+            let end_idx = line_start + line_len;
+            if start_idx < end_idx {
+                self.buffer.remove(start_idx..end_idx);
+                self.buffer_dirty = true;
+            }
+        }
+    }
+
     fn update_scroll(&mut self) {
         if !self.follow_cursor {
             return;
@@ -984,9 +1016,19 @@ fn main() -> io::Result<()> {
             let should_break = match event::read()? {
                 Event::Key(key) => {
                     if key.modifiers.contains(KeyModifiers::CONTROL) {
+                        // Emacs keybindings (Ctrl+key)
                         match key.code {
                             KeyCode::Char('c') => true,
                             KeyCode::Char('s') => { let _ = app.save_file(); false }
+                            KeyCode::Char('a') => { app.move_to_line_start(); false }
+                            KeyCode::Char('e') => { app.move_to_line_end(); false }
+                            KeyCode::Char('f') => { app.move_right(); false }
+                            KeyCode::Char('b') => { app.move_left(); false }
+                            KeyCode::Char('p') => { app.move_up(); false }
+                            KeyCode::Char('n') => { app.move_down(); false }
+                            KeyCode::Char('d') => { app.delete_char_delete(); false }
+                            KeyCode::Char('h') => { app.delete_char_backspace(); false }
+                            KeyCode::Char('k') => { app.kill_line(); false }
                             _ => false,
                         }
                     } else if key.modifiers.contains(KeyModifiers::ALT) {
