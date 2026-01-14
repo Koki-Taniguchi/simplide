@@ -131,8 +131,11 @@ struct App {
     sidebar_area: Rect,
     editor_area: Rect,
     scroll_offset: usize,
+    horizontal_scroll: usize,
     sidebar_scroll: usize,
     syntax: SyntaxHighlighter,
+    highlight_cache: Option<Vec<Color>>,
+    buffer_dirty: bool,
 }
 
 impl App {
@@ -149,8 +152,11 @@ impl App {
             sidebar_area: Rect::default(),
             editor_area: Rect::default(),
             scroll_offset: 0,
+            horizontal_scroll: 0,
             sidebar_scroll: 0,
             syntax: SyntaxHighlighter::new(),
+            highlight_cache: None,
+            buffer_dirty: false,
         }
     }
 
@@ -178,6 +184,9 @@ impl App {
             self.cursor_line = 0;
             self.cursor_col = 0;
             self.scroll_offset = 0;
+            self.horizontal_scroll = 0;
+            self.highlight_cache = None;
+            self.buffer_dirty = true;
         }
     }
 
@@ -261,6 +270,7 @@ impl App {
     fn insert_char(&mut self, c: char) {
         let idx = self.cursor_char_idx();
         self.buffer.insert_char(idx, c);
+        self.buffer_dirty = true;
         if c == '\n' {
             self.cursor_line += 1;
             self.cursor_col = 0;
@@ -274,6 +284,7 @@ impl App {
         if idx > 0 {
             let prev_char = self.buffer.char(idx - 1);
             self.buffer.remove(idx - 1..idx);
+            self.buffer_dirty = true;
             if prev_char == '\n' {
                 self.cursor_line -= 1;
                 self.cursor_col = self.current_line_len();
@@ -287,18 +298,74 @@ impl App {
         let idx = self.cursor_char_idx();
         if idx < self.buffer.len_chars() {
             self.buffer.remove(idx..idx + 1);
+            self.buffer_dirty = true;
         }
     }
 
     fn update_scroll(&mut self) {
+        // 縦スクロール
         let visible_height = self.editor_area.height.saturating_sub(2) as usize;
-        if visible_height == 0 {
-            return;
+        if visible_height > 0 {
+            if self.cursor_line < self.scroll_offset {
+                self.scroll_offset = self.cursor_line;
+            } else if self.cursor_line >= self.scroll_offset + visible_height {
+                self.scroll_offset = self.cursor_line.saturating_sub(visible_height) + 1;
+            }
         }
-        if self.cursor_line < self.scroll_offset {
-            self.scroll_offset = self.cursor_line;
-        } else if self.cursor_line >= self.scroll_offset + visible_height {
-            self.scroll_offset = self.cursor_line.saturating_sub(visible_height) + 1;
+
+        // 横スクロール
+        let visible_width = self.editor_area.width.saturating_sub(2) as usize;
+        if visible_width > 0 {
+            if self.cursor_col < self.horizontal_scroll {
+                self.horizontal_scroll = self.cursor_col;
+            } else if self.cursor_col >= self.horizontal_scroll + visible_width {
+                self.horizontal_scroll = self.cursor_col.saturating_sub(visible_width) + 1;
+            }
+        }
+    }
+
+    fn handle_editor_scroll(&mut self, x: u16, y: u16, delta: i16) {
+        if x >= self.editor_area.x
+            && x < self.editor_area.x + self.editor_area.width
+            && y >= self.editor_area.y
+            && y < self.editor_area.y + self.editor_area.height
+        {
+            let total_lines = self.buffer.len_lines();
+            let visible_height = self.editor_area.height.saturating_sub(2) as usize;
+            let max_scroll = total_lines.saturating_sub(visible_height);
+
+            if delta < 0 {
+                self.scroll_offset = self.scroll_offset.saturating_sub((-delta) as usize);
+            } else {
+                self.scroll_offset = (self.scroll_offset + delta as usize).min(max_scroll);
+            }
+        }
+    }
+
+    fn handle_editor_horizontal_scroll(&mut self, x: u16, y: u16, delta: i16) {
+        if x >= self.editor_area.x
+            && x < self.editor_area.x + self.editor_area.width
+            && y >= self.editor_area.y
+            && y < self.editor_area.y + self.editor_area.height
+        {
+            // 最長行の長さを計算
+            let max_line_len = (0..self.buffer.len_lines())
+                .map(|i| {
+                    let line = self.buffer.line(i);
+                    let len = line.len_chars();
+                    if len > 0 && line.char(len - 1) == '\n' { len - 1 } else { len }
+                })
+                .max()
+                .unwrap_or(0);
+
+            let visible_width = self.editor_area.width.saturating_sub(2) as usize;
+            let max_scroll = max_line_len.saturating_sub(visible_width);
+
+            if delta < 0 {
+                self.horizontal_scroll = self.horizontal_scroll.saturating_sub((-delta) as usize);
+            } else {
+                self.horizontal_scroll = (self.horizontal_scroll + delta as usize).min(max_scroll);
+            }
         }
     }
 
@@ -357,7 +424,7 @@ impl App {
             && y < self.editor_area.y + self.editor_area.height - 1
         {
             let clicked_line = (y - self.editor_area.y - 1) as usize + self.scroll_offset;
-            let clicked_col = (x - self.editor_area.x - 1) as usize;
+            let clicked_col = (x - self.editor_area.x - 1) as usize + self.horizontal_scroll;
 
             if clicked_line < self.buffer.len_lines() {
                 self.cursor_line = clicked_line;
@@ -366,16 +433,21 @@ impl App {
         }
     }
 
-    fn get_highlighted_lines(&mut self, visible_height: usize) -> Vec<Line<'static>> {
-        let source = self.buffer.to_string();
-        let is_rust = self.is_rust_file();
+    fn update_highlight_cache(&mut self) {
+        if self.buffer_dirty || self.highlight_cache.is_none() {
+            if self.is_rust_file() && self.buffer.len_chars() > 0 {
+                let source = self.buffer.to_string();
+                self.highlight_cache = Some(self.syntax.highlight_all(&source));
+            } else {
+                self.highlight_cache = None;
+            }
+            self.buffer_dirty = false;
+        }
+    }
 
-        // ハイライトを1回だけ計算
-        let colors = if is_rust && !source.is_empty() {
-            Some(self.syntax.highlight_all(&source))
-        } else {
-            None
-        };
+    fn get_highlighted_lines(&mut self, visible_height: usize, visible_width: usize) -> Vec<Line<'static>> {
+        // キャッシュを更新
+        self.update_highlight_cache();
 
         let mut lines = Vec::with_capacity(visible_height);
 
@@ -389,11 +461,14 @@ impl App {
                     line_text.pop();
                 }
 
-                if let Some(ref colors) = colors {
-                    let spans = self.build_spans_from_colors(&line_text, line_start, colors);
+                // 横スクロールを適用
+                let display_text = self.apply_horizontal_scroll(&line_text, visible_width);
+
+                if let Some(ref colors) = &self.highlight_cache {
+                    let spans = self.build_spans_from_colors(&line_text, line_start, colors, visible_width);
                     lines.push(Line::from(spans));
                 } else {
-                    lines.push(Line::from(line_text));
+                    lines.push(Line::from(display_text));
                 }
             } else {
                 lines.push(Line::from(Span::styled("~", Style::default().fg(Color::DarkGray))));
@@ -403,33 +478,58 @@ impl App {
         lines
     }
 
-    fn build_spans_from_colors(&self, line_text: &str, line_start: usize, colors: &[Color]) -> Vec<Span<'static>> {
+    fn apply_horizontal_scroll(&self, line_text: &str, visible_width: usize) -> String {
+        let chars: Vec<char> = line_text.chars().collect();
+        if self.horizontal_scroll >= chars.len() {
+            return String::new();
+        }
+        chars[self.horizontal_scroll..]
+            .iter()
+            .take(visible_width)
+            .collect()
+    }
+
+    fn build_spans_from_colors(&self, line_text: &str, line_start: usize, colors: &[Color], visible_width: usize) -> Vec<Span<'static>> {
         if line_text.is_empty() {
             return vec![];
         }
 
         let mut result = Vec::new();
-        let mut current_color = colors.get(line_start).copied().unwrap_or(Color::White);
+        let mut current_color: Option<Color> = None;
         let mut current_text = String::new();
         let mut byte_offset = 0;
+        let mut char_index = 0;
+        let mut visible_chars = 0;
 
         for ch in line_text.chars() {
             let byte_pos = line_start + byte_offset;
             let color = colors.get(byte_pos).copied().unwrap_or(Color::White);
 
-            if color != current_color {
-                if !current_text.is_empty() {
-                    result.push(Span::styled(current_text.clone(), Style::default().fg(current_color)));
-                    current_text.clear();
+            // 横スクロール範囲内の文字のみ処理
+            if char_index >= self.horizontal_scroll && visible_chars < visible_width {
+                if current_color.is_none() {
+                    current_color = Some(color);
                 }
-                current_color = color;
+
+                if Some(color) != current_color {
+                    if !current_text.is_empty() {
+                        result.push(Span::styled(current_text.clone(), Style::default().fg(current_color.unwrap())));
+                        current_text.clear();
+                    }
+                    current_color = Some(color);
+                }
+                current_text.push(ch);
+                visible_chars += 1;
             }
-            current_text.push(ch);
+
             byte_offset += ch.len_utf8();
+            char_index += 1;
         }
 
         if !current_text.is_empty() {
-            result.push(Span::styled(current_text, Style::default().fg(current_color)));
+            if let Some(color) = current_color {
+                result.push(Span::styled(current_text, Style::default().fg(color)));
+            }
         }
 
         result
@@ -511,7 +611,8 @@ fn main() -> io::Result<()> {
 
             // エディタ
             let visible_height = chunks[1].height.saturating_sub(2) as usize;
-            let lines = app.get_highlighted_lines(visible_height);
+            let visible_width = chunks[1].width.saturating_sub(2) as usize;
+            let lines = app.get_highlighted_lines(visible_height, visible_width);
 
             let editor = Paragraph::new(lines)
                 .block(Block::default()
@@ -519,8 +620,8 @@ fn main() -> io::Result<()> {
                     .borders(Borders::ALL));
             frame.render_widget(editor, chunks[1]);
 
-            // カーソル表示
-            let cursor_x = chunks[1].x + 1 + app.cursor_col as u16;
+            // カーソル表示（横スクロールを考慮）
+            let cursor_x = chunks[1].x + 1 + app.cursor_col.saturating_sub(app.horizontal_scroll) as u16;
             let cursor_y = chunks[1].y + 1 + app.cursor_line.saturating_sub(app.scroll_offset) as u16;
             frame.set_cursor_position((cursor_x, cursor_y));
         })?;
@@ -531,6 +632,23 @@ fn main() -> io::Result<()> {
                     match key.code {
                         KeyCode::Char('c') => break,
                         KeyCode::Char('s') => { let _ = app.save_file(); }
+                        _ => {}
+                    }
+                } else if key.modifiers.contains(KeyModifiers::ALT) {
+                    // Alt+矢印でスクロール
+                    match key.code {
+                        KeyCode::Left => {
+                            app.horizontal_scroll = app.horizontal_scroll.saturating_sub(5);
+                        }
+                        KeyCode::Right => {
+                            app.horizontal_scroll += 5;
+                        }
+                        KeyCode::Up => {
+                            app.scroll_offset = app.scroll_offset.saturating_sub(5);
+                        }
+                        KeyCode::Down => {
+                            app.scroll_offset += 5;
+                        }
                         _ => {}
                     }
                 } else {
@@ -548,16 +666,45 @@ fn main() -> io::Result<()> {
                 }
             }
             Event::Mouse(mouse) => {
+                let x = mouse.column;
+                let y = mouse.row;
+                let in_sidebar = x >= app.sidebar_area.x
+                    && x < app.sidebar_area.x + app.sidebar_area.width
+                    && y >= app.sidebar_area.y
+                    && y < app.sidebar_area.y + app.sidebar_area.height;
+                let in_editor = x >= app.editor_area.x
+                    && x < app.editor_area.x + app.editor_area.width
+                    && y >= app.editor_area.y
+                    && y < app.editor_area.y + app.editor_area.height;
+
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
-                        app.handle_sidebar_click(mouse.column, mouse.row);
-                        app.handle_editor_click(mouse.column, mouse.row);
+                        app.handle_sidebar_click(x, y);
+                        app.handle_editor_click(x, y);
                     }
                     MouseEventKind::ScrollUp => {
-                        app.handle_sidebar_scroll(mouse.column, mouse.row, -3);
+                        if in_sidebar {
+                            app.handle_sidebar_scroll(x, y, -1);
+                        } else if in_editor {
+                            app.handle_editor_scroll(x, y, -1);
+                        }
                     }
                     MouseEventKind::ScrollDown => {
-                        app.handle_sidebar_scroll(mouse.column, mouse.row, 3);
+                        if in_sidebar {
+                            app.handle_sidebar_scroll(x, y, 1);
+                        } else if in_editor {
+                            app.handle_editor_scroll(x, y, 1);
+                        }
+                    }
+                    MouseEventKind::ScrollLeft => {
+                        if in_editor {
+                            app.handle_editor_horizontal_scroll(x, y, -2);
+                        }
+                    }
+                    MouseEventKind::ScrollRight => {
+                        if in_editor {
+                            app.handle_editor_horizontal_scroll(x, y, 2);
+                        }
                     }
                     _ => {}
                 }
