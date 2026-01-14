@@ -452,6 +452,7 @@ struct App {
     horizontal_scroll: usize,
     sidebar_scroll: usize,
     sidebar_scroll_x: usize,
+    needs_clear: bool,
     syntax: SyntaxHighlighter,
     // キャッシュ
     source_cache: String,
@@ -590,6 +591,7 @@ impl App {
             horizontal_scroll: 0,
             sidebar_scroll: 0,
             sidebar_scroll_x: 0,
+            needs_clear: false,
             syntax: SyntaxHighlighter::new(&config.extensions),
             source_cache: String::new(),
             highlight_cache: None,
@@ -667,6 +669,7 @@ impl App {
             }
 
             self.file_path = Some(path.clone());
+            self.needs_clear = true;
 
             if is_image_file(path) {
                 // 画像ファイルの場合 - 非同期でデコード
@@ -836,6 +839,7 @@ impl App {
                     self.cursor_col = 0;
                     self.scroll_offset = 0;
                     self.horizontal_scroll = 0;
+                    self.needs_clear = true;
                 }
             }
         }
@@ -1534,7 +1538,14 @@ fn main() -> io::Result<()> {
 
         app.update_scroll();
 
-        terminal.draw(|frame| {
+        // 画面クリアが必要な場合
+        if app.needs_clear {
+            let _ = terminal.clear();
+            app.needs_clear = false;
+        }
+
+        // 描画（エラー時はスキップ）
+        if terminal.draw(|frame| {
             // ターミナルが小さすぎる場合はスキップ
             let area = frame.area();
             if area.width < 10 || area.height < 5 {
@@ -1551,6 +1562,11 @@ fn main() -> io::Result<()> {
                 ])
                 .split(area);
 
+            // チャンクが不足している場合はスキップ
+            if chunks.len() < 2 {
+                return;
+            }
+
             app.sidebar_area = chunks[0];
 
             // タブがある場合はエディタ領域を分割
@@ -1562,7 +1578,11 @@ fn main() -> io::Result<()> {
                         Constraint::Min(0),      // エディタ
                     ])
                     .split(chunks[1]);
-                (Some(editor_chunks[0]), editor_chunks[1])
+                if editor_chunks.len() < 2 {
+                    (None, chunks[1])
+                } else {
+                    (Some(editor_chunks[0]), editor_chunks[1])
+                }
             } else {
                 (None, chunks[1])
             };
@@ -1784,7 +1804,11 @@ fn main() -> io::Result<()> {
                 frame.render_widget(Clear, dialog_area);
                 frame.render_widget(dialog, dialog_area);
             }
-        })?;
+        }).is_err() {
+            // 描画エラー時は画面クリアを試みて続行
+            let _ = terminal.clear();
+            continue;
+        }
 
         // イベントをバッチ処理（溜まっているイベントを全て処理してから描画）
         use std::time::Duration;
@@ -2006,6 +2030,15 @@ fn main() -> io::Result<()> {
                 Event::Resize(_, _) => {
                     // ターミナルリサイズ時に画面をクリア
                     let _ = terminal.clear();
+
+                    // 画像モードの場合は画像状態をリセット（再レンダリング用）
+                    if app.is_image_mode {
+                        app.image_state = None;
+                        if let Some(path) = app.file_path.clone() {
+                            let _ = app.decode_tx.send((path, app.picker.clone(), app.image_tx.clone()));
+                            app.image_loading = true;
+                        }
+                    }
 
                     // カーソル行の調整
                     let total_lines = app.buffer.len_lines();
