@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::io;
 use std::panic;
@@ -504,9 +505,32 @@ fn get_git_branch(dir: &PathBuf) -> Option<String> {
 }
 
 impl App {
-    fn new() -> Self {
-        let current_dir = std::env::current_dir().unwrap_or_default();
-        let root_dir = current_dir.clone();
+    fn new(initial_path: Option<PathBuf>) -> Self {
+        // 初期パスの処理
+        let (root_dir, current_dir, initial_file) = if let Some(path) = initial_path {
+            let abs_path = if path.is_absolute() {
+                path
+            } else {
+                env::current_dir().unwrap_or_default().join(path)
+            };
+
+            if abs_path.is_file() {
+                // ファイルの場合：親ディレクトリを開き、ファイルを展開
+                let parent = abs_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+                (parent.clone(), parent, Some(abs_path))
+            } else if abs_path.is_dir() {
+                // ディレクトリの場合：そのディレクトリを開く
+                (abs_path.clone(), abs_path, None)
+            } else {
+                // 存在しない場合：カレントディレクトリ
+                let cwd = env::current_dir().unwrap_or_default();
+                (cwd.clone(), cwd, None)
+            }
+        } else {
+            let cwd = env::current_dir().unwrap_or_default();
+            (cwd.clone(), cwd, None)
+        };
+
         let entries = Self::read_dir(&current_dir);
         let git_branch = get_git_branch(&root_dir);
         let config = Config::load();
@@ -546,7 +570,7 @@ impl App {
             }
         });
 
-        App {
+        let mut app = App {
             root_dir,
             current_dir,
             entries,
@@ -581,7 +605,14 @@ impl App {
             tab_area: Rect::default(),
             git_branch,
             confirm_dialog: None,
+        };
+
+        // 初期ファイルがあれば開く
+        if let Some(file_path) = initial_file {
+            app.open_file(&file_path);
         }
+
+        app
     }
 
     /// 未保存のタブがあるかチェック
@@ -1278,6 +1309,10 @@ impl App {
 }
 
 fn main() -> io::Result<()> {
+    // コマンドライン引数を取得
+    let args: Vec<String> = env::args().collect();
+    let initial_path = args.get(1).map(PathBuf::from);
+
     let original_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
         reset_terminal();
@@ -1290,7 +1325,7 @@ fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new();
+    let mut app = App::new(initial_path);
 
     loop {
         // 画像デコード完了イベントを受け取る
