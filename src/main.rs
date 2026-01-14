@@ -486,6 +486,11 @@ struct App {
     git_branch: Option<String>,
     // 確認ダイアログ
     confirm_dialog: Option<ConfirmAction>,
+    // 検索機能
+    search_mode: bool,
+    search_query: String,
+    search_matches: Vec<(usize, usize)>,  // (line, col)
+    search_index: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -605,6 +610,10 @@ impl App {
             tab_area: Rect::default(),
             git_branch,
             confirm_dialog: None,
+            search_mode: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_index: 0,
         };
 
         // 初期ファイルがあれば開く
@@ -827,6 +836,79 @@ impl App {
                     self.horizontal_scroll = 0;
                 }
             }
+        }
+    }
+
+    /// 検索を実行してマッチ位置を更新
+    fn search(&mut self) {
+        self.search_matches.clear();
+        self.search_index = 0;
+
+        if self.search_query.is_empty() {
+            return;
+        }
+
+        let query_chars: Vec<char> = self.search_query.chars().collect();
+        let query_len = query_chars.len();
+
+        for (line_idx, line) in self.buffer.lines().enumerate() {
+            let line_chars: Vec<char> = line.chars().collect();
+            if line_chars.len() < query_len {
+                continue;
+            }
+
+            // 文字単位で検索
+            for col in 0..=line_chars.len().saturating_sub(query_len) {
+                let mut matched = true;
+                for (i, &qc) in query_chars.iter().enumerate() {
+                    if line_chars.get(col + i) != Some(&qc) {
+                        matched = false;
+                        break;
+                    }
+                }
+                if matched {
+                    self.search_matches.push((line_idx, col));
+                }
+            }
+        }
+
+        // 現在のカーソル位置以降の最初のマッチを選択
+        for (i, &(line, col)) in self.search_matches.iter().enumerate() {
+            if line > self.cursor_line || (line == self.cursor_line && col >= self.cursor_col) {
+                self.search_index = i;
+                break;
+            }
+        }
+    }
+
+    /// 次のマッチに移動
+    fn next_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        self.search_index = (self.search_index + 1) % self.search_matches.len();
+        self.jump_to_match();
+    }
+
+    /// 前のマッチに移動
+    fn prev_match(&mut self) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        if self.search_index == 0 {
+            self.search_index = self.search_matches.len() - 1;
+        } else {
+            self.search_index -= 1;
+        }
+        self.jump_to_match();
+    }
+
+    /// 現在のマッチ位置にジャンプ
+    fn jump_to_match(&mut self) {
+        if let Some(&(line, col)) = self.search_matches.get(self.search_index) {
+            self.cursor_line = line;
+            self.cursor_col = col;
+            self.follow_cursor = true;
         }
     }
 
@@ -1232,11 +1314,12 @@ impl App {
                 if let Some((line_text, line_start)) = self.get_line_from_cache(line_idx) {
                     if let Some(ref colors) = &self.highlight_cache {
                         let mut spans = vec![ln_span];
-                        spans.extend(self.build_spans_from_colors(line_text, line_start, colors, content_width));
+                        spans.extend(self.build_spans_from_colors(line_text, line_start, colors, content_width, line_idx));
                         lines.push(Line::from(spans));
                     } else {
-                        let display_text = self.apply_horizontal_scroll(line_text, content_width);
-                        lines.push(Line::from(vec![ln_span, Span::raw(display_text)]));
+                        let mut spans = vec![ln_span];
+                        spans.extend(self.build_spans_simple(line_text, content_width, line_idx));
+                        lines.push(Line::from(spans));
                     }
                 } else {
                     lines.push(Line::from(vec![ln_span]));
@@ -1250,24 +1333,39 @@ impl App {
         lines
     }
 
-    fn apply_horizontal_scroll(&self, line_text: &str, visible_width: usize) -> String {
-        let chars: Vec<char> = line_text.chars().collect();
-        if self.horizontal_scroll >= chars.len() {
-            return String::new();
+    /// 指定位置が検索マッチ内かどうかチェック
+    fn is_in_search_match(&self, line_idx: usize, col: usize) -> bool {
+        if !self.search_mode || self.search_query.is_empty() {
+            return false;
         }
-        chars[self.horizontal_scroll..]
-            .iter()
-            .take(visible_width)
-            .collect()
+        let query_len = self.search_query.chars().count();
+        for &(match_line, match_col) in &self.search_matches {
+            if match_line == line_idx && col >= match_col && col < match_col + query_len {
+                return true;
+            }
+        }
+        false
     }
 
-    fn build_spans_from_colors(&self, line_text: &str, line_start: usize, colors: &[Color], visible_width: usize) -> Vec<Span<'static>> {
+    /// 現在のマッチ位置かどうかチェック
+    fn is_current_match(&self, line_idx: usize, col: usize) -> bool {
+        if !self.search_mode || self.search_query.is_empty() {
+            return false;
+        }
+        if let Some(&(match_line, match_col)) = self.search_matches.get(self.search_index) {
+            let query_len = self.search_query.chars().count();
+            return match_line == line_idx && col >= match_col && col < match_col + query_len;
+        }
+        false
+    }
+
+    fn build_spans_from_colors(&self, line_text: &str, line_start: usize, colors: &[Color], visible_width: usize, line_idx: usize) -> Vec<Span<'static>> {
         if line_text.is_empty() {
             return vec![];
         }
 
         let mut result = Vec::new();
-        let mut current_color: Option<Color> = None;
+        let mut current_style: Option<Style> = None;
         let mut current_text = String::new();
         let mut byte_offset = 0;
         let mut char_index = 0;
@@ -1275,20 +1373,29 @@ impl App {
 
         for ch in line_text.chars() {
             let byte_pos = line_start + byte_offset;
-            let color = colors.get(byte_pos).copied().unwrap_or(Color::White);
+            let fg_color = colors.get(byte_pos).copied().unwrap_or(Color::White);
 
             // 横スクロール範囲内の文字のみ処理
             if char_index >= self.horizontal_scroll && visible_chars < visible_width {
-                if current_color.is_none() {
-                    current_color = Some(color);
+                // 検索マッチのハイライト
+                let style = if self.is_current_match(line_idx, char_index) {
+                    Style::default().fg(Color::Black).bg(Color::Yellow)
+                } else if self.is_in_search_match(line_idx, char_index) {
+                    Style::default().fg(fg_color).bg(Color::DarkGray)
+                } else {
+                    Style::default().fg(fg_color)
+                };
+
+                if current_style.is_none() {
+                    current_style = Some(style);
                 }
 
-                if Some(color) != current_color {
+                if Some(style) != current_style {
                     if !current_text.is_empty() {
-                        result.push(Span::styled(current_text.clone(), Style::default().fg(current_color.unwrap())));
+                        result.push(Span::styled(current_text.clone(), current_style.unwrap()));
                         current_text.clear();
                     }
-                    current_color = Some(color);
+                    current_style = Some(style);
                 }
                 current_text.push(ch);
                 visible_chars += 1;
@@ -1299,8 +1406,53 @@ impl App {
         }
 
         if !current_text.is_empty() {
-            if let Some(color) = current_color {
-                result.push(Span::styled(current_text, Style::default().fg(color)));
+            if let Some(style) = current_style {
+                result.push(Span::styled(current_text, style));
+            }
+        }
+
+        result
+    }
+
+    fn build_spans_simple(&self, line_text: &str, visible_width: usize, line_idx: usize) -> Vec<Span<'static>> {
+        let mut result = Vec::new();
+        let mut current_style: Option<Style> = None;
+        let mut current_text = String::new();
+        let mut char_index = 0;
+        let mut visible_chars = 0;
+
+        for ch in line_text.chars() {
+            if char_index >= self.horizontal_scroll && visible_chars < visible_width {
+                let style = if self.is_current_match(line_idx, char_index) {
+                    Style::default().fg(Color::Black).bg(Color::Yellow)
+                } else if self.is_in_search_match(line_idx, char_index) {
+                    Style::default().bg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
+
+                if current_style.is_none() {
+                    current_style = Some(style);
+                }
+
+                if Some(style) != current_style {
+                    if !current_text.is_empty() {
+                        result.push(Span::styled(current_text.clone(), current_style.unwrap()));
+                        current_text.clear();
+                    }
+                    current_style = Some(style);
+                }
+                current_text.push(ch);
+                visible_chars += 1;
+            }
+            char_index += 1;
+        }
+
+        if !current_text.is_empty() {
+            if let Some(style) = current_style {
+                result.push(Span::styled(current_text, style));
+            } else {
+                result.push(Span::raw(current_text));
             }
         }
 
@@ -1508,7 +1660,35 @@ fn main() -> io::Result<()> {
                 let display_col = app.cursor_display_col();
                 let cursor_x = editor_area.x + 1 + ln_width + display_col.saturating_sub(app.horizontal_scroll) as u16;
                 let cursor_y = editor_area.y + 1 + app.cursor_line.saturating_sub(app.scroll_offset) as u16;
-                frame.set_cursor_position((cursor_x, cursor_y));
+
+                // 検索バー
+                if app.search_mode {
+                    let search_area = Rect::new(
+                        editor_area.x,
+                        editor_area.y + editor_area.height.saturating_sub(1),
+                        editor_area.width,
+                        1,
+                    );
+                    let match_info = if app.search_matches.is_empty() {
+                        if app.search_query.is_empty() {
+                            String::new()
+                        } else {
+                            " (no match)".to_string()
+                        }
+                    } else {
+                        format!(" ({}/{})", app.search_index + 1, app.search_matches.len())
+                    };
+                    let search_text = format!("Search: {}{}", app.search_query, match_info);
+                    let search_bar = Paragraph::new(search_text)
+                        .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+                    frame.render_widget(search_bar, search_area);
+                    // 検索バーにカーソルを表示
+                    let search_cursor_x = editor_area.x + 8 + app.search_query.len() as u16;
+                    let search_cursor_y = editor_area.y + editor_area.height.saturating_sub(1);
+                    frame.set_cursor_position((search_cursor_x, search_cursor_y));
+                } else {
+                    frame.set_cursor_position((cursor_x, cursor_y));
+                }
             }
 
             // 確認ダイアログ
@@ -1572,6 +1752,72 @@ fn main() -> io::Result<()> {
                             }
                             _ => false,
                         }
+                    // 検索モード中の場合
+                    } else if app.search_mode {
+                        // 検索モードでのCtrl+キー処理
+                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            match key.code {
+                                KeyCode::Char('h') => {
+                                    // Ctrl+H: Backspace
+                                    app.search_query.pop();
+                                    app.search();
+                                    app.jump_to_match();
+                                    false
+                                }
+                                KeyCode::Char('u') => {
+                                    // Ctrl+U: クリア
+                                    app.search_query.clear();
+                                    app.search();
+                                    false
+                                }
+                                KeyCode::Char('n') | KeyCode::Char('g') => {
+                                    // Ctrl+N/Ctrl+G: 次のマッチ
+                                    app.next_match();
+                                    false
+                                }
+                                KeyCode::Char('p') => {
+                                    // Ctrl+P: 前のマッチ
+                                    app.prev_match();
+                                    false
+                                }
+                                KeyCode::Char('c') => {
+                                    // Ctrl+C: 検索終了
+                                    app.search_mode = false;
+                                    app.search_matches.clear();
+                                    false
+                                }
+                                _ => false,
+                            }
+                        } else {
+                            match key.code {
+                                KeyCode::Esc => {
+                                    app.search_mode = false;
+                                    app.search_matches.clear();
+                                    false
+                                }
+                                KeyCode::Enter => {
+                                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                        app.prev_match();
+                                    } else {
+                                        app.next_match();
+                                    }
+                                    false
+                                }
+                                KeyCode::Backspace => {
+                                    app.search_query.pop();
+                                    app.search();
+                                    app.jump_to_match();
+                                    false
+                                }
+                                KeyCode::Char(c) => {
+                                    app.search_query.push(c);
+                                    app.search();
+                                    app.jump_to_match();
+                                    false
+                                }
+                                _ => false,
+                            }
+                        }
                     // Command-S (macOS) または Ctrl-S で保存
                     } else if (key.modifiers.contains(KeyModifiers::SUPER) || key.modifiers.contains(KeyModifiers::CONTROL))
                         && key.code == KeyCode::Char('s')
@@ -1591,7 +1837,13 @@ fn main() -> io::Result<()> {
                             }
                             KeyCode::Char('a') => { app.move_to_line_start(); false }
                             KeyCode::Char('e') => { app.move_to_line_end(); false }
-                            KeyCode::Char('f') => { app.move_right(); false }
+                            KeyCode::Char('f') => {
+                                // 検索モード開始
+                                app.search_mode = true;
+                                app.search_query.clear();
+                                app.search_matches.clear();
+                                false
+                            }
                             KeyCode::Char('b') => { app.move_left(); false }
                             KeyCode::Char('p') => { app.move_up(); false }
                             KeyCode::Char('n') => { app.move_down(); false }
