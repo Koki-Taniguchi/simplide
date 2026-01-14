@@ -44,7 +44,32 @@ enum Language {
     Markdown,
     MarkdownInline,
     Php,
+    Make,
+    Hcl,
 }
+
+// HCL用のハイライトクエリ（tree-sitter-hclには含まれていないため）
+const HCL_HIGHLIGHTS_QUERY: &str = r#"
+(comment) @comment
+(identifier) @variable
+(numeric_lit) @number
+(bool_lit) @constant.builtin
+(null_lit) @constant.builtin
+(string_lit) @string
+(heredoc_template) @string
+
+(attribute (identifier) @property)
+(block (identifier) @keyword)
+(block (string_lit) @string)
+
+(function_call (identifier) @function)
+
+["=" "==" "!=" "<" ">" "<=" ">=" "+" "-" "*" "/" "%" "&&" "||" "!"] @operator
+["(" ")" "[" "]" "{" "}"] @punctuation.bracket
+["," "." ":"] @punctuation.delimiter
+
+["for" "endfor" "in" "if" "else" "endif"] @keyword
+"#;
 
 #[derive(Debug, Deserialize, Default)]
 struct Config {
@@ -296,6 +321,30 @@ impl SyntaxHighlighter {
             configs.insert(Language::Php, config);
         }
 
+        // Makefile
+        if let Ok(mut config) = HighlightConfiguration::new(
+            tree_sitter_make::LANGUAGE.into(),
+            "make",
+            tree_sitter_make::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ) {
+            config.configure(HIGHLIGHT_NAMES);
+            configs.insert(Language::Make, config);
+        }
+
+        // HCL (Terraform)
+        if let Ok(mut config) = HighlightConfiguration::new(
+            tree_sitter_hcl::LANGUAGE.into(),
+            "hcl",
+            HCL_HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ) {
+            config.configure(HIGHLIGHT_NAMES);
+            configs.insert(Language::Hcl, config);
+        }
+
         // デフォルトの拡張子マッピング
         let mut extension_map = HashMap::new();
         extension_map.insert("rs".to_string(), Language::Rust);
@@ -317,6 +366,10 @@ impl SyntaxHighlighter {
         extension_map.insert("md".to_string(), Language::Markdown);
         extension_map.insert("markdown".to_string(), Language::Markdown);
         extension_map.insert("php".to_string(), Language::Php);
+        extension_map.insert("mk".to_string(), Language::Make);
+        extension_map.insert("tf".to_string(), Language::Hcl);
+        extension_map.insert("tfvars".to_string(), Language::Hcl);
+        extension_map.insert("hcl".to_string(), Language::Hcl);
 
         // カスタム拡張子マッピングを適用
         for (ext, lang_str) in custom_extensions {
@@ -345,11 +398,21 @@ impl SyntaxHighlighter {
             "yaml" | "yml" => Some(Language::Yaml),
             "markdown" | "md" => Some(Language::Markdown),
             "php" => Some(Language::Php),
+            "make" | "makefile" => Some(Language::Make),
+            "hcl" | "terraform" | "tf" => Some(Language::Hcl),
             _ => None,
         }
     }
 
     fn detect_language(&self, path: &PathBuf) -> Option<Language> {
+        // まずファイル名で判定（Makefileなど拡張子がないファイル用）
+        if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+            match file_name {
+                "Makefile" | "makefile" | "GNUmakefile" => return Some(Language::Make),
+                _ => {}
+            }
+        }
+        // 拡張子で判定
         path.extension()
             .and_then(|ext| ext.to_str())
             .and_then(|ext| self.extension_map.get(ext).copied())
@@ -380,6 +443,8 @@ impl SyntaxHighlighter {
                 "markdown" => Some(Language::Markdown),
                 "markdown_inline" => Some(Language::MarkdownInline),
                 "php" => Some(Language::Php),
+                "make" | "makefile" => Some(Language::Make),
+                "hcl" | "terraform" | "tf" => Some(Language::Hcl),
                 _ => None,
             };
             lang.and_then(|l| configs.get(&l))
