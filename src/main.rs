@@ -427,6 +427,16 @@ fn decode_image(path: &PathBuf) -> Option<image::DynamicImage> {
         .ok()
 }
 
+/// 未保存のファイル状態を保持する構造体
+struct UnsavedFile {
+    buffer: Rope,
+    saved_content: String,
+    cursor_line: usize,
+    cursor_col: usize,
+    scroll_offset: usize,
+    horizontal_scroll: usize,
+}
+
 struct App {
     root_dir: PathBuf,
     current_dir: PathBuf,
@@ -466,6 +476,11 @@ struct App {
     // 画像デコード用スレッド通信
     decode_tx: Sender<(PathBuf, Picker, Sender<(StatefulProtocol, Resize, Rect)>)>,
     decode_rx: Receiver<ThreadProtocol>,
+    // 未保存ファイルの保持（タブ機能）
+    unsaved_files: HashMap<PathBuf, UnsavedFile>,
+    // タブ管理
+    tabs: Vec<PathBuf>,
+    tab_area: Rect,
 }
 
 impl App {
@@ -540,6 +555,9 @@ impl App {
             image_rx: rx_main,
             decode_tx,
             decode_rx,
+            unsaved_files: HashMap::new(),
+            tabs: Vec::new(),
+            tab_area: Rect::default(),
         }
     }
 
@@ -553,6 +571,26 @@ impl App {
 
     fn open_file(&mut self, path: &PathBuf) {
         if path.is_file() {
+            // 現在のファイルの状態を保存（未保存の場合のみ）
+            if let Some(current_path) = &self.file_path.clone() {
+                if !self.is_image_mode {
+                    if self.is_unsaved() {
+                        // 未保存なら保持
+                        self.unsaved_files.insert(current_path.clone(), UnsavedFile {
+                            buffer: self.buffer.clone(),
+                            saved_content: self.saved_content.clone(),
+                            cursor_line: self.cursor_line,
+                            cursor_col: self.cursor_col,
+                            scroll_offset: self.scroll_offset,
+                            horizontal_scroll: self.horizontal_scroll,
+                        });
+                    } else {
+                        // 保存済みならメモリから削除
+                        self.unsaved_files.remove(current_path);
+                    }
+                }
+            }
+
             self.file_path = Some(path.clone());
 
             if is_image_file(path) {
@@ -563,9 +601,26 @@ impl App {
                 self.image_loading = true;
                 // テキストバッファはクリア
                 self.buffer = Rope::new();
+                self.saved_content.clear();
                 self.current_language = None;
+                self.cursor_line = 0;
+                self.cursor_col = 0;
+                self.scroll_offset = 0;
+                self.horizontal_scroll = 0;
+            } else if let Some(unsaved) = self.unsaved_files.remove(path) {
+                // 未保存の状態があれば復元
+                self.buffer = unsaved.buffer;
+                self.saved_content = unsaved.saved_content;
+                self.cursor_line = unsaved.cursor_line;
+                self.cursor_col = unsaved.cursor_col;
+                self.scroll_offset = unsaved.scroll_offset;
+                self.horizontal_scroll = unsaved.horizontal_scroll;
+                self.current_language = self.syntax.detect_language(path);
+                self.image_state = None;
+                self.is_image_mode = false;
+                self.image_loading = false;
             } else {
-                // テキストファイルの場合
+                // ディスクから読み込み
                 let content = fs::read_to_string(path).unwrap_or_else(|_| String::new());
                 self.buffer = Rope::from_str(&content);
                 self.saved_content = content;
@@ -573,12 +628,12 @@ impl App {
                 self.image_state = None;
                 self.is_image_mode = false;
                 self.image_loading = false;
+                self.cursor_line = 0;
+                self.cursor_col = 0;
+                self.scroll_offset = 0;
+                self.horizontal_scroll = 0;
             }
 
-            self.cursor_line = 0;
-            self.cursor_col = 0;
-            self.scroll_offset = 0;
-            self.horizontal_scroll = 0;
             self.source_cache.clear();
             self.highlight_cache = None;
             self.line_offsets.clear();
@@ -598,6 +653,102 @@ impl App {
 
     fn is_unsaved(&self) -> bool {
         self.buffer.to_string() != self.saved_content
+    }
+
+    /// 現在のファイルをタブに追加（まだなければ）
+    fn add_to_tabs(&mut self) {
+        if let Some(path) = &self.file_path {
+            if !self.tabs.contains(path) {
+                self.tabs.push(path.clone());
+            }
+        }
+    }
+
+    /// 次のタブに切り替え
+    fn next_tab(&mut self) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        if let Some(current) = &self.file_path {
+            if let Some(idx) = self.tabs.iter().position(|p| p == current) {
+                let next_idx = (idx + 1) % self.tabs.len();
+                let next_path = self.tabs[next_idx].clone();
+                self.open_file(&next_path);
+            }
+        }
+    }
+
+    /// 前のタブに切り替え
+    fn prev_tab(&mut self) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        if let Some(current) = &self.file_path {
+            if let Some(idx) = self.tabs.iter().position(|p| p == current) {
+                let prev_idx = if idx == 0 { self.tabs.len() - 1 } else { idx - 1 };
+                let prev_path = self.tabs[prev_idx].clone();
+                self.open_file(&prev_path);
+            }
+        }
+    }
+
+    /// タブバーのクリック処理
+    fn handle_tab_click(&mut self, x: u16, y: u16) {
+        if !self.tabs.is_empty()
+            && y == self.tab_area.y
+            && x >= self.tab_area.x
+            && x < self.tab_area.x + self.tab_area.width
+        {
+            // クリック位置からタブを特定
+            let mut current_x = self.tab_area.x;
+            for path in &self.tabs.clone() {
+                let file_name = path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "New".to_string());
+
+                let is_unsaved = if Some(path) == self.file_path.as_ref() {
+                    self.is_unsaved()
+                } else {
+                    self.unsaved_files.contains_key(path)
+                };
+
+                let unsaved_mark = if is_unsaved { "*" } else { "" };
+                let tab_text = format!(" {}{} ", file_name, unsaved_mark);
+                let tab_len = tab_text.len() as u16;
+
+                if x >= current_x && x < current_x + tab_len {
+                    // このタブがクリックされた
+                    self.open_file(path);
+                    return;
+                }
+
+                current_x += tab_len + 1; // +1 for space between tabs
+            }
+        }
+    }
+
+    /// タブを閉じる
+    fn close_current_tab(&mut self) {
+        if let Some(current) = &self.file_path.clone() {
+            // 未保存でなければタブから削除
+            if !self.is_unsaved() {
+                if let Some(idx) = self.tabs.iter().position(|p| p == current) {
+                    self.tabs.remove(idx);
+                    self.unsaved_files.remove(current);
+                    // 別のタブがあれば切り替え
+                    if !self.tabs.is_empty() {
+                        let new_idx = idx.min(self.tabs.len() - 1);
+                        let new_path = self.tabs[new_idx].clone();
+                        self.open_file(&new_path);
+                    } else {
+                        // タブがなくなったらクリア
+                        self.file_path = None;
+                        self.buffer = Rope::new();
+                        self.saved_content.clear();
+                    }
+                }
+            }
+        }
     }
 
     fn file_name(&self) -> String {
@@ -709,11 +860,12 @@ impl App {
     }
 
     fn insert_char(&mut self, c: char) {
+        self.add_to_tabs();
         self.follow_cursor = true;
         let idx = self.cursor_char_idx();
         self.buffer.insert_char(idx, c);
         self.buffer_dirty = true;
-                if c == '\n' {
+        if c == '\n' {
             self.cursor_line += 1;
             self.cursor_col = 0;
         } else {
@@ -722,13 +874,14 @@ impl App {
     }
 
     fn delete_char_backspace(&mut self) {
+        self.add_to_tabs();
         self.follow_cursor = true;
         let idx = self.cursor_char_idx();
         if idx > 0 {
             let prev_char = self.buffer.char(idx - 1);
             self.buffer.remove(idx - 1..idx);
             self.buffer_dirty = true;
-                        if prev_char == '\n' {
+            if prev_char == '\n' {
                 self.cursor_line -= 1;
                 self.cursor_col = self.current_line_len();
             } else {
@@ -738,12 +891,13 @@ impl App {
     }
 
     fn delete_char_delete(&mut self) {
+        self.add_to_tabs();
         self.follow_cursor = true;
         let idx = self.cursor_char_idx();
         if idx < self.buffer.len_chars() {
             self.buffer.remove(idx..idx + 1);
             self.buffer_dirty = true;
-                    }
+        }
     }
 
     fn move_to_line_start(&mut self) {
@@ -757,6 +911,7 @@ impl App {
     }
 
     fn kill_line(&mut self) {
+        self.add_to_tabs();
         self.follow_cursor = true;
         let line_len = self.current_line_len();
         if self.cursor_col >= line_len {
@@ -765,7 +920,7 @@ impl App {
             if idx < self.buffer.len_chars() {
                 self.buffer.remove(idx..idx + 1);
                 self.buffer_dirty = true;
-                            }
+            }
         } else {
             // カーソルから行末まで削除
             let start_idx = self.cursor_char_idx();
@@ -774,7 +929,7 @@ impl App {
             if start_idx < end_idx {
                 self.buffer.remove(start_idx..end_idx);
                 self.buffer_dirty = true;
-                            }
+            }
         }
     }
 
@@ -1110,7 +1265,57 @@ fn main() -> io::Result<()> {
                 .split(frame.area());
 
             app.sidebar_area = chunks[0];
-            app.editor_area = chunks[1];
+
+            // タブがある場合はエディタ領域を分割
+            let (tab_area, editor_area) = if !app.tabs.is_empty() {
+                let editor_chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),  // タブバー
+                        Constraint::Min(0),      // エディタ
+                    ])
+                    .split(chunks[1]);
+                (Some(editor_chunks[0]), editor_chunks[1])
+            } else {
+                (None, chunks[1])
+            };
+            app.tab_area = tab_area.unwrap_or(Rect::default());
+            app.editor_area = editor_area;
+
+            // タブバーの描画
+            if let Some(tab_rect) = tab_area {
+                let mut tab_spans: Vec<Span> = Vec::new();
+
+                for path in app.tabs.iter() {
+                    let file_name = path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "New".to_string());
+
+                    // このタブが未保存かチェック
+                    let is_unsaved = if Some(path) == app.file_path.as_ref() {
+                        app.is_unsaved()
+                    } else {
+                        app.unsaved_files.contains_key(path)
+                    };
+
+                    let is_active = Some(path) == app.file_path.as_ref();
+                    let unsaved_mark = if is_unsaved { "*" } else { "" };
+                    let tab_text = format!(" {}{} ", file_name, unsaved_mark);
+
+                    let style = if is_active {
+                        Style::default().bg(Color::DarkGray).fg(Color::White)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+
+                    tab_spans.push(Span::styled(tab_text, style));
+                    tab_spans.push(Span::raw(" ")); // タブ間のスペース
+                }
+
+                let tab_line = Line::from(tab_spans);
+                let tab_bar = Paragraph::new(vec![tab_line]);
+                frame.render_widget(tab_bar, tab_rect);
+            }
 
             // サイドバー（スクロール対応）
             let entry_names: Vec<String> = app.entries.iter().map(|path| {
@@ -1177,8 +1382,8 @@ fn main() -> io::Result<()> {
                 let block = Block::default()
                     .title(format!("{} [Ctrl-C: Quit]", app.file_name()))
                     .borders(Borders::ALL);
-                let inner = block.inner(chunks[1]);
-                frame.render_widget(block, chunks[1]);
+                let inner = block.inner(editor_area);
+                frame.render_widget(block, editor_area);
 
                 if app.image_loading {
                     // ローディング中
@@ -1190,21 +1395,21 @@ fn main() -> io::Result<()> {
                 }
             } else {
                 // テキストモード
-                let visible_height = chunks[1].height.saturating_sub(2) as usize;
-                let visible_width = chunks[1].width.saturating_sub(2) as usize;
+                let visible_height = editor_area.height.saturating_sub(2) as usize;
+                let visible_width = editor_area.width.saturating_sub(2) as usize;
                 let lines = app.get_highlighted_lines(visible_height, visible_width);
 
                 let editor = Paragraph::new(lines)
                     .block(Block::default()
-                        .title(format!("{}{} [Ctrl-S: Save, Ctrl-C: Quit]", app.file_name(), if app.is_unsaved() { " *" } else { "" }))
+                        .title(format!("{}{} [C-S:Save C-W:Close C-]/:Tab C-C:Quit]", app.file_name(), if app.is_unsaved() { " *" } else { "" }))
                         .borders(Borders::ALL));
-                frame.render_widget(editor, chunks[1]);
+                frame.render_widget(editor, editor_area);
 
                 // カーソル表示（行番号と横スクロール、全角文字幅を考慮）
                 let ln_width = app.line_number_width() as u16;
                 let display_col = app.cursor_display_col();
-                let cursor_x = chunks[1].x + 1 + ln_width + display_col.saturating_sub(app.horizontal_scroll) as u16;
-                let cursor_y = chunks[1].y + 1 + app.cursor_line.saturating_sub(app.scroll_offset) as u16;
+                let cursor_x = editor_area.x + 1 + ln_width + display_col.saturating_sub(app.horizontal_scroll) as u16;
+                let cursor_y = editor_area.y + 1 + app.cursor_line.saturating_sub(app.scroll_offset) as u16;
                 frame.set_cursor_position((cursor_x, cursor_y));
             }
         })?;
@@ -1243,6 +1448,9 @@ fn main() -> io::Result<()> {
                             KeyCode::Char('d') => { app.delete_char_delete(); false }
                             KeyCode::Char('h') => { app.delete_char_backspace(); false }
                             KeyCode::Char('k') => { app.kill_line(); false }
+                            KeyCode::Char('w') => { app.close_current_tab(); false }  // タブを閉じる
+                            KeyCode::Char(']') => { app.next_tab(); false }  // 次のタブ
+                            KeyCode::Char('[') => { app.prev_tab(); false }  // 前のタブ
                             _ => false,
                         }
                     } else if key.modifiers.contains(KeyModifiers::ALT) {
@@ -1289,6 +1497,7 @@ fn main() -> io::Result<()> {
 
                     match mouse.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
+                            app.handle_tab_click(x, y);
                             app.handle_sidebar_click(x, y);
                             app.handle_editor_click(x, y);
                         }
