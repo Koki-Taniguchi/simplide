@@ -417,14 +417,15 @@ impl App {
     }
 
     fn handle_editor_click(&mut self, x: u16, y: u16) {
-        if x >= self.editor_area.x + 1
+        let ln_width = self.line_number_width() as u16;
+        if x >= self.editor_area.x + 1 + ln_width
             && x < self.editor_area.x + self.editor_area.width - 1
             && y >= self.editor_area.y + 1
             && y < self.editor_area.y + self.editor_area.height - 1
         {
             self.follow_cursor = true;
             let clicked_line = (y - self.editor_area.y - 1) as usize + self.scroll_offset;
-            let clicked_col = (x - self.editor_area.x - 1) as usize + self.horizontal_scroll;
+            let clicked_col = (x - self.editor_area.x - 1 - ln_width) as usize + self.horizontal_scroll;
 
             if clicked_line < self.buffer.len_lines() {
                 self.cursor_line = clicked_line;
@@ -482,29 +483,45 @@ impl App {
         Some((&self.source_cache[start..text_end], start))
     }
 
+    fn line_number_width(&self) -> usize {
+        let total = self.buffer.len_lines().max(1);
+        let digits = (total as f64).log10().floor() as usize + 1;
+        digits + 1 // +1 for space after number
+    }
+
     fn get_highlighted_lines(&mut self, visible_height: usize, visible_width: usize) -> Vec<Line<'static>> {
         // キャッシュを更新
         self.update_cache();
 
         let mut lines = Vec::with_capacity(visible_height);
-        let total_lines = self.line_offsets.len();
+        let total_lines = self.line_offsets.len().max(1);
+        let ln_width = self.line_number_width();
+        let content_width = visible_width.saturating_sub(ln_width);
 
         for i in 0..visible_height {
             let line_idx = self.scroll_offset + i;
+            let line_num = line_idx + 1;
+
             if line_idx < total_lines {
+                // 行番号
+                let ln_str = format!("{:>width$} ", line_num, width = ln_width - 1);
+                let ln_span = Span::styled(ln_str, Style::default().fg(Color::DarkGray));
+
                 if let Some((line_text, line_start)) = self.get_line_from_cache(line_idx) {
                     if let Some(ref colors) = &self.highlight_cache {
-                        let spans = self.build_spans_from_colors(line_text, line_start, colors, visible_width);
+                        let mut spans = vec![ln_span];
+                        spans.extend(self.build_spans_from_colors(line_text, line_start, colors, content_width));
                         lines.push(Line::from(spans));
                     } else {
-                        let display_text = self.apply_horizontal_scroll(line_text, visible_width);
-                        lines.push(Line::from(display_text));
+                        let display_text = self.apply_horizontal_scroll(line_text, content_width);
+                        lines.push(Line::from(vec![ln_span, Span::raw(display_text)]));
                     }
                 } else {
-                    lines.push(Line::from(""));
+                    lines.push(Line::from(vec![ln_span]));
                 }
             } else {
-                lines.push(Line::from(Span::styled("~", Style::default().fg(Color::DarkGray))));
+                let ln_str = format!("{:>width$} ", "~", width = ln_width - 1);
+                lines.push(Line::from(Span::styled(ln_str, Style::default().fg(Color::DarkGray))));
             }
         }
 
@@ -653,8 +670,9 @@ fn main() -> io::Result<()> {
                     .borders(Borders::ALL));
             frame.render_widget(editor, chunks[1]);
 
-            // カーソル表示（横スクロールを考慮）
-            let cursor_x = chunks[1].x + 1 + app.cursor_col.saturating_sub(app.horizontal_scroll) as u16;
+            // カーソル表示（行番号と横スクロールを考慮）
+            let ln_width = app.line_number_width() as u16;
+            let cursor_x = chunks[1].x + 1 + ln_width + app.cursor_col.saturating_sub(app.horizontal_scroll) as u16;
             let cursor_y = chunks[1].y + 1 + app.cursor_line.saturating_sub(app.scroll_offset) as u16;
             frame.set_cursor_position((cursor_x, cursor_y));
         })?;
