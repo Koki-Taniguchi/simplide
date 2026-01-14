@@ -699,18 +699,24 @@ impl App {
 
     fn handle_editor_click(&mut self, x: u16, y: u16) {
         let ln_width = self.line_number_width() as u16;
-        if x >= self.editor_area.x + 1 + ln_width
+        // エディタ領域内（ボーダー除く）かつ有効な行をクリックした場合
+        if x >= self.editor_area.x + 1
             && x < self.editor_area.x + self.editor_area.width - 1
             && y >= self.editor_area.y + 1
             && y < self.editor_area.y + self.editor_area.height - 1
         {
             self.follow_cursor = true;
             let clicked_line = (y - self.editor_area.y - 1) as usize + self.scroll_offset;
-            let clicked_col = (x - self.editor_area.x - 1 - ln_width) as usize + self.horizontal_scroll;
 
             if clicked_line < self.buffer.len_lines() {
                 self.cursor_line = clicked_line;
-                self.cursor_col = clicked_col.min(self.current_line_len());
+                // 行番号領域をクリックした場合は行頭に移動
+                if x < self.editor_area.x + 1 + ln_width {
+                    self.cursor_col = 0;
+                } else {
+                    let clicked_col = (x - self.editor_area.x - 1 - ln_width) as usize + self.horizontal_scroll;
+                    self.cursor_col = clicked_col.min(self.current_line_len());
+                }
             }
         }
     }
