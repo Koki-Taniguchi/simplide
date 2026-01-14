@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::panic;
@@ -17,7 +18,46 @@ use ratatui::{
     Terminal,
 };
 use ropey::Rope;
+use serde::Deserialize;
 use tree_sitter_highlight::{Highlight, HighlightConfiguration, HighlightEvent, Highlighter};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Language {
+    Rust,
+    JavaScript,
+    TypeScript,
+    Tsx,
+    Go,
+    Python,
+    Json,
+    Toml,
+    Yaml,
+    Markdown,
+    MarkdownInline,
+    Php,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct Config {
+    #[serde(default)]
+    extensions: HashMap<String, String>,
+}
+
+impl Config {
+    fn load() -> Self {
+        let config_path = dirs::config_dir()
+            .map(|p| p.join("simplide").join("config.toml"));
+
+        if let Some(path) = config_path {
+            if let Ok(content) = fs::read_to_string(&path) {
+                if let Ok(config) = toml::from_str(&content) {
+                    return config;
+                }
+            }
+        }
+        Config::default()
+    }
+}
 
 fn reset_terminal() {
     let _ = disable_raw_mode();
@@ -38,6 +78,27 @@ const HIGHLIGHT_NAMES: &[&str] = &[
     "constant",
     "attribute",
     "property",
+    // Markdown用
+    "text.title",
+    "text.literal",
+    "text.uri",
+    "text.reference",
+    "text.emphasis",
+    "text.strong",
+    "punctuation.special",
+    "punctuation.delimiter",
+    "string.escape",
+    "markup.heading",
+    "markup.link",
+    "markup.list",
+    "markup.raw",
+    // 追加の一般的なハイライト名
+    "tag",
+    "label",
+    "namespace",
+    "module",
+    "parameter",
+    "field",
 ];
 
 fn highlight_color(highlight: Highlight) -> Color {
@@ -54,45 +115,268 @@ fn highlight_color(highlight: Highlight) -> Color {
         Some(&"constant") => Color::Cyan,
         Some(&"attribute") => Color::Yellow,
         Some(&"property") => Color::Blue,
+        // Markdown用
+        Some(&"text.title") => Color::Yellow,
+        Some(&"text.literal") => Color::Green,
+        Some(&"text.uri") => Color::Cyan,
+        Some(&"text.reference") => Color::Blue,
+        Some(&"text.emphasis") => Color::LightYellow,
+        Some(&"text.strong") => Color::LightRed,
+        Some(&"punctuation.special") => Color::Magenta,
+        Some(&"punctuation.delimiter") => Color::DarkGray,
+        Some(&"string.escape") => Color::Red,
+        Some(&"markup.heading") => Color::Yellow,
+        Some(&"markup.link") => Color::Cyan,
+        Some(&"markup.list") => Color::Magenta,
+        Some(&"markup.raw") => Color::Green,
+        // 追加
+        Some(&"tag") => Color::Red,
+        Some(&"label") => Color::Yellow,
+        Some(&"namespace") => Color::Yellow,
+        Some(&"module") => Color::Yellow,
+        Some(&"parameter") => Color::White,
+        Some(&"field") => Color::Blue,
         _ => Color::White,
     }
 }
 
 struct SyntaxHighlighter {
     highlighter: Highlighter,
-    rust_config: Option<HighlightConfiguration>,
+    configs: HashMap<Language, HighlightConfiguration>,
+    extension_map: HashMap<String, Language>,
 }
 
 impl SyntaxHighlighter {
-    fn new() -> Self {
+    fn new(custom_extensions: &HashMap<String, String>) -> Self {
         let highlighter = Highlighter::new();
+        let mut configs = HashMap::new();
 
-        let mut rust_config = HighlightConfiguration::new(
+        // Rust
+        if let Ok(mut config) = HighlightConfiguration::new(
             tree_sitter_rust::LANGUAGE.into(),
             "rust",
             tree_sitter_rust::HIGHLIGHTS_QUERY,
-            "",  // injections
-            "",  // locals
-        ).ok();
-
-        if let Some(ref mut config) = rust_config {
+            "", "",
+        ) {
             config.configure(HIGHLIGHT_NAMES);
+            configs.insert(Language::Rust, config);
+        }
+
+        // JavaScript
+        if let Ok(mut config) = HighlightConfiguration::new(
+            tree_sitter_javascript::LANGUAGE.into(),
+            "javascript",
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            tree_sitter_javascript::INJECTIONS_QUERY,
+            tree_sitter_javascript::LOCALS_QUERY,
+        ) {
+            config.configure(HIGHLIGHT_NAMES);
+            configs.insert(Language::JavaScript, config);
+        }
+
+        // TypeScript
+        if let Ok(mut config) = HighlightConfiguration::new(
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "typescript",
+            tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            "", "",
+        ) {
+            config.configure(HIGHLIGHT_NAMES);
+            configs.insert(Language::TypeScript, config);
+        }
+
+        // TSX
+        if let Ok(mut config) = HighlightConfiguration::new(
+            tree_sitter_typescript::LANGUAGE_TSX.into(),
+            "tsx",
+            tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            "", "",
+        ) {
+            config.configure(HIGHLIGHT_NAMES);
+            configs.insert(Language::Tsx, config);
+        }
+
+        // Go
+        if let Ok(mut config) = HighlightConfiguration::new(
+            tree_sitter_go::LANGUAGE.into(),
+            "go",
+            tree_sitter_go::HIGHLIGHTS_QUERY,
+            "", "",
+        ) {
+            config.configure(HIGHLIGHT_NAMES);
+            configs.insert(Language::Go, config);
+        }
+
+        // Python
+        if let Ok(mut config) = HighlightConfiguration::new(
+            tree_sitter_python::LANGUAGE.into(),
+            "python",
+            tree_sitter_python::HIGHLIGHTS_QUERY,
+            "", "",
+        ) {
+            config.configure(HIGHLIGHT_NAMES);
+            configs.insert(Language::Python, config);
+        }
+
+        // JSON
+        if let Ok(mut config) = HighlightConfiguration::new(
+            tree_sitter_json::LANGUAGE.into(),
+            "json",
+            tree_sitter_json::HIGHLIGHTS_QUERY,
+            "", "",
+        ) {
+            config.configure(HIGHLIGHT_NAMES);
+            configs.insert(Language::Json, config);
+        }
+
+        // TOML
+        if let Ok(mut config) = HighlightConfiguration::new(
+            tree_sitter_toml_ng::language().into(),
+            "toml",
+            tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
+            "", "",
+        ) {
+            config.configure(HIGHLIGHT_NAMES);
+            configs.insert(Language::Toml, config);
+        }
+
+        // YAML
+        if let Ok(mut config) = HighlightConfiguration::new(
+            tree_sitter_yaml::LANGUAGE.into(),
+            "yaml",
+            tree_sitter_yaml::HIGHLIGHTS_QUERY,
+            "", "",
+        ) {
+            config.configure(HIGHLIGHT_NAMES);
+            configs.insert(Language::Yaml, config);
+        }
+
+        // Markdown block parser
+        if let Ok(mut config) = HighlightConfiguration::new(
+            tree_sitter_md::LANGUAGE.into(),
+            "markdown",
+            tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
+            tree_sitter_md::INJECTION_QUERY_BLOCK,
+            "",
+        ) {
+            config.configure(HIGHLIGHT_NAMES);
+            configs.insert(Language::Markdown, config);
+        }
+
+        // Markdown inline parser (for injection callback)
+        if let Ok(mut config) = HighlightConfiguration::new(
+            tree_sitter_md::INLINE_LANGUAGE.into(),
+            "markdown_inline",
+            tree_sitter_md::HIGHLIGHT_QUERY_INLINE,
+            "",
+            "",
+        ) {
+            config.configure(HIGHLIGHT_NAMES);
+            configs.insert(Language::MarkdownInline, config);
+        }
+
+        // PHP
+        if let Ok(mut config) = HighlightConfiguration::new(
+            tree_sitter_php::LANGUAGE_PHP.into(),
+            "php",
+            tree_sitter_php::HIGHLIGHTS_QUERY,
+            tree_sitter_php::INJECTIONS_QUERY,
+            "",
+        ) {
+            config.configure(HIGHLIGHT_NAMES);
+            configs.insert(Language::Php, config);
+        }
+
+        // デフォルトの拡張子マッピング
+        let mut extension_map = HashMap::new();
+        extension_map.insert("rs".to_string(), Language::Rust);
+        extension_map.insert("js".to_string(), Language::JavaScript);
+        extension_map.insert("mjs".to_string(), Language::JavaScript);
+        extension_map.insert("cjs".to_string(), Language::JavaScript);
+        extension_map.insert("jsx".to_string(), Language::JavaScript);
+        extension_map.insert("ts".to_string(), Language::TypeScript);
+        extension_map.insert("mts".to_string(), Language::TypeScript);
+        extension_map.insert("cts".to_string(), Language::TypeScript);
+        extension_map.insert("tsx".to_string(), Language::Tsx);
+        extension_map.insert("go".to_string(), Language::Go);
+        extension_map.insert("py".to_string(), Language::Python);
+        extension_map.insert("pyw".to_string(), Language::Python);
+        extension_map.insert("json".to_string(), Language::Json);
+        extension_map.insert("toml".to_string(), Language::Toml);
+        extension_map.insert("yaml".to_string(), Language::Yaml);
+        extension_map.insert("yml".to_string(), Language::Yaml);
+        extension_map.insert("md".to_string(), Language::Markdown);
+        extension_map.insert("markdown".to_string(), Language::Markdown);
+        extension_map.insert("php".to_string(), Language::Php);
+
+        // カスタム拡張子マッピングを適用
+        for (ext, lang_str) in custom_extensions {
+            if let Some(lang) = Self::parse_language(lang_str) {
+                extension_map.insert(ext.clone(), lang);
+            }
         }
 
         SyntaxHighlighter {
             highlighter,
-            rust_config,
+            configs,
+            extension_map,
         }
     }
 
+    fn parse_language(s: &str) -> Option<Language> {
+        match s.to_lowercase().as_str() {
+            "rust" | "rs" => Some(Language::Rust),
+            "javascript" | "js" => Some(Language::JavaScript),
+            "typescript" | "ts" => Some(Language::TypeScript),
+            "tsx" => Some(Language::Tsx),
+            "go" | "golang" => Some(Language::Go),
+            "python" | "py" => Some(Language::Python),
+            "json" => Some(Language::Json),
+            "toml" => Some(Language::Toml),
+            "yaml" | "yml" => Some(Language::Yaml),
+            "markdown" | "md" => Some(Language::Markdown),
+            "php" => Some(Language::Php),
+            _ => None,
+        }
+    }
+
+    fn detect_language(&self, path: &PathBuf) -> Option<Language> {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .and_then(|ext| self.extension_map.get(ext).copied())
+    }
+
     /// ファイル全体をハイライトして、各バイト位置に対応する色を返す
-    fn highlight_all(&mut self, source: &str) -> Vec<Color> {
-        let config = match &self.rust_config {
+    fn highlight_all(&mut self, source: &str, language: Language) -> Vec<Color> {
+        let config = match self.configs.get(&language) {
             Some(c) => c,
             None => return vec![Color::White; source.len()],
         };
 
-        let highlights = match self.highlighter.highlight(config, source.as_bytes(), None, |_| None) {
+        // configsへの参照を取得（borrow checkerのためにここで分離）
+        let configs = &self.configs;
+
+        // injection callback - 言語名から設定を解決
+        let injection_callback = |lang_name: &str| -> Option<&HighlightConfiguration> {
+            let lang = match lang_name {
+                "rust" => Some(Language::Rust),
+                "javascript" | "js" => Some(Language::JavaScript),
+                "typescript" | "ts" => Some(Language::TypeScript),
+                "tsx" => Some(Language::Tsx),
+                "go" => Some(Language::Go),
+                "python" => Some(Language::Python),
+                "json" => Some(Language::Json),
+                "toml" => Some(Language::Toml),
+                "yaml" | "yml" => Some(Language::Yaml),
+                "markdown" => Some(Language::Markdown),
+                "markdown_inline" => Some(Language::MarkdownInline),
+                "php" => Some(Language::Php),
+                _ => None,
+            };
+            lang.and_then(|l| configs.get(&l))
+        };
+
+        let highlights = match self.highlighter.highlight(config, source.as_bytes(), None, injection_callback) {
             Ok(h) => h,
             Err(_) => return vec![Color::White; source.len()],
         };
@@ -142,12 +426,15 @@ struct App {
     line_offsets: Vec<usize>,
     // カーソル追従を有効にするか
     follow_cursor: bool,
+    // 現在のファイルの言語
+    current_language: Option<Language>,
 }
 
 impl App {
     fn new() -> Self {
         let current_dir = std::env::current_dir().unwrap_or_default();
         let entries = Self::read_dir(&current_dir);
+        let config = Config::load();
         App {
             current_dir,
             entries,
@@ -160,12 +447,13 @@ impl App {
             scroll_offset: 0,
             horizontal_scroll: 0,
             sidebar_scroll: 0,
-            syntax: SyntaxHighlighter::new(),
+            syntax: SyntaxHighlighter::new(&config.extensions),
             source_cache: String::new(),
             highlight_cache: None,
             buffer_dirty: false,
             line_offsets: Vec::new(),
             follow_cursor: true,
+            current_language: None,
         }
     }
 
@@ -177,19 +465,12 @@ impl App {
         entries
     }
 
-    fn is_rust_file(&self) -> bool {
-        self.file_path
-            .as_ref()
-            .and_then(|p| p.extension())
-            .map(|ext| ext == "rs")
-            .unwrap_or(false)
-    }
-
     fn open_file(&mut self, path: &PathBuf) {
         if path.is_file() {
             let content = fs::read_to_string(path).unwrap_or_else(|_| String::new());
             self.buffer = Rope::from_str(&content);
             self.file_path = Some(path.clone());
+            self.current_language = self.syntax.detect_language(path);
             self.cursor_line = 0;
             self.cursor_col = 0;
             self.scroll_offset = 0;
@@ -455,8 +736,12 @@ impl App {
         }
 
         // ハイライトキャッシュを更新
-        if self.is_rust_file() && !self.source_cache.is_empty() {
-            self.highlight_cache = Some(self.syntax.highlight_all(&self.source_cache));
+        if let Some(lang) = self.current_language {
+            if !self.source_cache.is_empty() {
+                self.highlight_cache = Some(self.syntax.highlight_all(&self.source_cache, lang));
+            } else {
+                self.highlight_cache = None;
+            }
         } else {
             self.highlight_cache = None;
         }
