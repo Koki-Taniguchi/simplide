@@ -406,6 +406,7 @@ impl SyntaxHighlighter {
 }
 
 struct App {
+    root_dir: PathBuf,
     current_dir: PathBuf,
     entries: Vec<PathBuf>,
     buffer: Rope,
@@ -433,9 +434,11 @@ struct App {
 impl App {
     fn new() -> Self {
         let current_dir = std::env::current_dir().unwrap_or_default();
+        let root_dir = current_dir.clone();
         let entries = Self::read_dir(&current_dir);
         let config = Config::load();
         App {
+            root_dir,
             current_dir,
             entries,
             buffer: Rope::new(),
@@ -967,13 +970,29 @@ fn main() -> io::Result<()> {
                 })
                 .collect();
 
+            let dir_name = if app.current_dir == app.root_dir {
+                app.root_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "/".to_string())
+            } else {
+                let root_name = app.root_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let rel_path = app.current_dir
+                    .strip_prefix(&app.root_dir)
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| app.current_dir.to_string_lossy().to_string());
+                format!("{}/{}", root_name, rel_path)
+            };
             let title = if total_items > visible_height {
                 format!("{} [{}/{}]",
-                    app.current_dir.to_string_lossy(),
+                    dir_name,
                     app.sidebar_scroll + 1,
                     total_items.saturating_sub(visible_height) + 1)
             } else {
-                app.current_dir.to_string_lossy().to_string()
+                dir_name
             };
 
             let sidebar = List::new(items)
