@@ -1535,13 +1535,21 @@ fn main() -> io::Result<()> {
         app.update_scroll();
 
         terminal.draw(|frame| {
+            // ターミナルが小さすぎる場合はスキップ
+            let area = frame.area();
+            if area.width < 10 || area.height < 5 {
+                let msg = Paragraph::new("Terminal too small");
+                frame.render_widget(msg, area);
+                return;
+            }
+
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
                     Constraint::Percentage(20),
                     Constraint::Percentage(80),
                 ])
-                .split(frame.area());
+                .split(area);
 
             app.sidebar_area = chunks[0];
 
@@ -1681,13 +1689,16 @@ fn main() -> io::Result<()> {
                 let inner = block.inner(editor_area);
                 frame.render_widget(block, editor_area);
 
-                if app.image_loading {
-                    // ローディング中
-                    let loading = Paragraph::new("Loading...");
-                    frame.render_widget(loading, inner);
-                } else if let Some(ref mut image_state) = app.image_state {
-                    let image_widget = ThreadImage::default();
-                    frame.render_stateful_widget(image_widget, inner, image_state);
+                // 画像領域が十分な大きさの場合のみ描画
+                if inner.width > 0 && inner.height > 0 {
+                    if app.image_loading {
+                        // ローディング中
+                        let loading = Paragraph::new("Loading...");
+                        frame.render_widget(loading, inner);
+                    } else if let Some(ref mut image_state) = app.image_state {
+                        let image_widget = ThreadImage::default();
+                        frame.render_stateful_widget(image_widget, inner, image_state);
+                    }
                 }
             } else {
                 // テキストモード
@@ -1710,31 +1721,39 @@ fn main() -> io::Result<()> {
                 let cursor_x = editor_area.x + 1 + ln_width + display_col.saturating_sub(app.horizontal_scroll) as u16;
                 let cursor_y = editor_area.y + 1 + app.cursor_line.saturating_sub(app.scroll_offset) as u16;
 
+                // カーソル位置を画面内に制限
+                let max_x = editor_area.x + editor_area.width.saturating_sub(1);
+                let max_y = editor_area.y + editor_area.height.saturating_sub(1);
+                let cursor_x = cursor_x.min(max_x);
+                let cursor_y = cursor_y.min(max_y);
+
                 // 検索バー
                 if app.search_mode {
-                    let search_area = Rect::new(
-                        editor_area.x,
-                        editor_area.y + editor_area.height.saturating_sub(1),
-                        editor_area.width,
-                        1,
-                    );
-                    let match_info = if app.search_matches.is_empty() {
-                        if app.search_query.is_empty() {
-                            String::new()
+                    if editor_area.height >= 2 {
+                        let search_area = Rect::new(
+                            editor_area.x,
+                            editor_area.y + editor_area.height.saturating_sub(1),
+                            editor_area.width,
+                            1,
+                        );
+                        let match_info = if app.search_matches.is_empty() {
+                            if app.search_query.is_empty() {
+                                String::new()
+                            } else {
+                                " (no match)".to_string()
+                            }
                         } else {
-                            " (no match)".to_string()
-                        }
-                    } else {
-                        format!(" ({}/{})", app.search_index + 1, app.search_matches.len())
-                    };
-                    let search_text = format!("Search: {}{}", app.search_query, match_info);
-                    let search_bar = Paragraph::new(search_text)
-                        .style(Style::default().bg(Color::DarkGray).fg(Color::White));
-                    frame.render_widget(search_bar, search_area);
-                    // 検索バーにカーソルを表示
-                    let search_cursor_x = editor_area.x + 8 + app.search_query.len() as u16;
-                    let search_cursor_y = editor_area.y + editor_area.height.saturating_sub(1);
-                    frame.set_cursor_position((search_cursor_x, search_cursor_y));
+                            format!(" ({}/{})", app.search_index + 1, app.search_matches.len())
+                        };
+                        let search_text = format!("Search: {}{}", app.search_query, match_info);
+                        let search_bar = Paragraph::new(search_text)
+                            .style(Style::default().bg(Color::DarkGray).fg(Color::White));
+                        frame.render_widget(search_bar, search_area);
+                        // 検索バーにカーソルを表示（画面内に制限）
+                        let search_cursor_x = (editor_area.x + 8 + app.search_query.len() as u16).min(max_x);
+                        let search_cursor_y = editor_area.y + editor_area.height.saturating_sub(1);
+                        frame.set_cursor_position((search_cursor_x, search_cursor_y));
+                    }
                 } else {
                     frame.set_cursor_position((cursor_x, cursor_y));
                 }
@@ -1982,6 +2001,35 @@ fn main() -> io::Result<()> {
                         }
                         _ => {}
                     }
+                    false
+                }
+                Event::Resize(_, _) => {
+                    // ターミナルリサイズ時に画面をクリア
+                    let _ = terminal.clear();
+
+                    // カーソル行の調整
+                    let total_lines = app.buffer.len_lines();
+                    if app.cursor_line >= total_lines {
+                        app.cursor_line = total_lines.saturating_sub(1);
+                    }
+                    // カーソル列の調整
+                    app.clamp_cursor_col();
+                    // 垂直スクロールの調整
+                    if app.scroll_offset > total_lines.saturating_sub(1) {
+                        app.scroll_offset = total_lines.saturating_sub(1);
+                    }
+                    // 水平スクロールの調整
+                    if app.horizontal_scroll > app.max_line_width {
+                        app.horizontal_scroll = 0;
+                    }
+                    // サイドバーの垂直スクロール調整
+                    let show_parent = app.current_dir != app.root_dir;
+                    let total_items = app.entries.len() + if show_parent { 1 } else { 0 };
+                    if app.sidebar_scroll >= total_items {
+                        app.sidebar_scroll = total_items.saturating_sub(1);
+                    }
+                    // サイドバーの水平スクロールをリセット
+                    app.sidebar_scroll_x = 0;
                     false
                 }
                 _ => false,
