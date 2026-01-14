@@ -994,21 +994,25 @@ impl App {
         {
             let visible_index = (y - self.sidebar_area.y - 1) as usize;
             let index = visible_index + self.sidebar_scroll;
+            let show_parent = self.current_dir != self.root_dir;
 
-            if index == 0 {
+            if show_parent && index == 0 {
                 if let Some(parent) = self.current_dir.parent() {
                     self.current_dir = parent.to_path_buf();
                     self.entries = Self::read_dir(&self.current_dir);
                     self.sidebar_scroll = 0;
                 }
-            } else if index - 1 < self.entries.len() {
-                let path = self.entries[index - 1].clone();
-                if path.is_dir() {
-                    self.current_dir = path;
-                    self.entries = Self::read_dir(&self.current_dir);
-                    self.sidebar_scroll = 0;
-                } else {
-                    self.open_file(&path);
+            } else {
+                let entry_index = if show_parent { index - 1 } else { index };
+                if entry_index < self.entries.len() {
+                    let path = self.entries[entry_index].clone();
+                    if path.is_dir() {
+                        self.current_dir = path;
+                        self.entries = Self::read_dir(&self.current_dir);
+                        self.sidebar_scroll = 0;
+                    } else {
+                        self.open_file(&path);
+                    }
                 }
             }
         }
@@ -1020,7 +1024,8 @@ impl App {
             && y >= self.sidebar_area.y
             && y < self.sidebar_area.y + self.sidebar_area.height
         {
-            let total_items = self.entries.len() + 1; // +1 for ".."
+            let show_parent = self.current_dir != self.root_dir;
+            let total_items = self.entries.len() + if show_parent { 1 } else { 0 };
             let visible_height = self.sidebar_area.height.saturating_sub(2) as usize;
             let max_scroll = total_items.saturating_sub(visible_height);
 
@@ -1330,15 +1335,22 @@ fn main() -> io::Result<()> {
             }).collect();
 
             let visible_height = chunks[0].height.saturating_sub(2) as usize;
-            let total_items = 1 + entry_names.len(); // ".." + entries
+            let show_parent = app.current_dir != app.root_dir;
+            let total_items = entry_names.len() + if show_parent { 1 } else { 0 };
 
             let items: Vec<ListItem> = (0..visible_height)
                 .filter_map(|i| {
                     let idx = app.sidebar_scroll + i;
-                    if idx == 0 {
-                        Some(ListItem::new(Line::from("..")))
-                    } else if idx - 1 < entry_names.len() {
-                        Some(ListItem::new(Line::from(entry_names[idx - 1].clone())))
+                    if show_parent {
+                        if idx == 0 {
+                            Some(ListItem::new(Line::from("..")))
+                        } else if idx - 1 < entry_names.len() {
+                            Some(ListItem::new(Line::from(entry_names[idx - 1].clone())))
+                        } else {
+                            None
+                        }
+                    } else if idx < entry_names.len() {
+                        Some(ListItem::new(Line::from(entry_names[idx].clone())))
                     } else {
                         None
                     }
