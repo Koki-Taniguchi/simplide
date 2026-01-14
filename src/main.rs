@@ -11,7 +11,7 @@ use crossterm::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
@@ -481,6 +481,18 @@ struct App {
     // タブ管理
     tabs: Vec<PathBuf>,
     tab_area: Rect,
+    // Git branch
+    git_branch: Option<String>,
+}
+
+fn get_git_branch(dir: &PathBuf) -> Option<String> {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .current_dir(dir)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
 impl App {
@@ -488,6 +500,7 @@ impl App {
         let current_dir = std::env::current_dir().unwrap_or_default();
         let root_dir = current_dir.clone();
         let entries = Self::read_dir(&current_dir);
+        let git_branch = get_git_branch(&root_dir);
         let config = Config::load();
         let picker = Picker::from_query_stdio()
             .unwrap_or_else(|_| Picker::from_fontsize((8, 12)));
@@ -558,6 +571,7 @@ impl App {
             unsaved_files: HashMap::new(),
             tabs: Vec::new(),
             tab_area: Rect::default(),
+            git_branch,
         }
     }
 
@@ -1411,10 +1425,13 @@ fn main() -> io::Result<()> {
                 let visible_width = editor_area.width.saturating_sub(2) as usize;
                 let lines = app.get_highlighted_lines(visible_height, visible_width);
 
-                let editor = Paragraph::new(lines)
-                    .block(Block::default()
-                        .title(format!("{}{} [C-S:Save C-W:Close C-]/:Tab C-C:Quit]", app.file_name(), if app.is_unsaved() { " *" } else { "" }))
-                        .borders(Borders::ALL));
+                let mut editor_block = Block::default()
+                    .title(format!("{}{} [C-S:Save C-W:Close C-]/:Tab C-C:Quit]", app.file_name(), if app.is_unsaved() { " *" } else { "" }))
+                    .borders(Borders::ALL);
+                if let Some(ref branch) = app.git_branch {
+                    editor_block = editor_block.title_top(Line::from(format!(" {} ", branch)).alignment(Alignment::Right));
+                }
+                let editor = Paragraph::new(lines).block(editor_block);
                 frame.render_widget(editor, editor_area);
 
                 // カーソル表示（行番号と横スクロール、全角文字幅を考慮）
