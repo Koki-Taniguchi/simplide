@@ -789,8 +789,8 @@ impl App {
     fn handle_sidebar_click(&mut self, x: u16, y: u16) {
         if x >= self.sidebar_area.x
             && x < self.sidebar_area.x + self.sidebar_area.width
-            && y >= self.sidebar_area.y
-            && y < self.sidebar_area.y + self.sidebar_area.height
+            && y > self.sidebar_area.y
+            && y < self.sidebar_area.y + self.sidebar_area.height.saturating_sub(1)
         {
             let visible_index = (y - self.sidebar_area.y - 1) as usize;
             let index = visible_index + self.sidebar_scroll;
@@ -1278,8 +1278,4 @@ fn main() -> io::Result<()> {
             }
         }
     }
-
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
-    Ok(())
 }
