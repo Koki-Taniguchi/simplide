@@ -451,6 +451,7 @@ struct App {
     scroll_offset: usize,
     horizontal_scroll: usize,
     sidebar_scroll: usize,
+    sidebar_scroll_x: usize,
     syntax: SyntaxHighlighter,
     // キャッシュ
     source_cache: String,
@@ -588,6 +589,7 @@ impl App {
             scroll_offset: 0,
             horizontal_scroll: 0,
             sidebar_scroll: 0,
+            sidebar_scroll_x: 0,
             syntax: SyntaxHighlighter::new(&config.extensions),
             source_cache: String::new(),
             highlight_cache: None,
@@ -1162,6 +1164,7 @@ impl App {
                     self.current_dir = parent.to_path_buf();
                     self.entries = Self::read_dir(&self.current_dir);
                     self.sidebar_scroll = 0;
+                    self.sidebar_scroll_x = 0;
                 }
             } else {
                 let entry_index = if show_parent { index - 1 } else { index };
@@ -1171,6 +1174,7 @@ impl App {
                         self.current_dir = path;
                         self.entries = Self::read_dir(&self.current_dir);
                         self.sidebar_scroll = 0;
+                    self.sidebar_scroll_x = 0;
                     } else {
                         self.open_file(&path);
                     }
@@ -1196,6 +1200,41 @@ impl App {
             } else {
                 // Scroll down
                 self.sidebar_scroll = (self.sidebar_scroll + delta as usize).min(max_scroll);
+            }
+        }
+    }
+
+    fn handle_sidebar_horizontal_scroll(&mut self, x: u16, y: u16, delta: i16) {
+        if x >= self.sidebar_area.x
+            && x < self.sidebar_area.x + self.sidebar_area.width
+            && y >= self.sidebar_area.y
+            && y < self.sidebar_area.y + self.sidebar_area.height
+        {
+            // エントリの最大文字幅を計算
+            let show_parent = self.current_dir != self.root_dir;
+            let max_entry_width = self.entries.iter()
+                .map(|e| {
+                    let name = e.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    let display = if e.is_dir() {
+                        format!("{}/", name)
+                    } else {
+                        name
+                    };
+                    display.chars().count()
+                })
+                .max()
+                .unwrap_or(0)
+                .max(if show_parent { 2 } else { 0 }); // ".." の幅も考慮
+
+            let visible_width = self.sidebar_area.width.saturating_sub(2) as usize; // ボーダー分を引く
+            let max_scroll = max_entry_width.saturating_sub(visible_width);
+
+            if delta < 0 {
+                // Scroll left
+                self.sidebar_scroll_x = self.sidebar_scroll_x.saturating_sub((-delta) as usize);
+            } else {
+                // Scroll right
+                self.sidebar_scroll_x = (self.sidebar_scroll_x + delta as usize).min(max_scroll);
             }
         }
     }
@@ -1573,19 +1612,29 @@ fn main() -> io::Result<()> {
             let show_parent = app.current_dir != app.root_dir;
             let total_items = entry_names.len() + if show_parent { 1 } else { 0 };
 
+            // 横スクロールを適用するヘルパー
+            let apply_h_scroll = |s: &str, scroll_x: usize| -> String {
+                let chars: Vec<char> = s.chars().collect();
+                if scroll_x >= chars.len() {
+                    String::new()
+                } else {
+                    chars[scroll_x..].iter().collect()
+                }
+            };
+
             let items: Vec<ListItem> = (0..visible_height)
                 .filter_map(|i| {
                     let idx = app.sidebar_scroll + i;
                     if show_parent {
                         if idx == 0 {
-                            Some(ListItem::new(Line::from("..")))
+                            Some(ListItem::new(Line::from(apply_h_scroll("..", app.sidebar_scroll_x))))
                         } else if idx - 1 < entry_names.len() {
-                            Some(ListItem::new(Line::from(entry_names[idx - 1].clone())))
+                            Some(ListItem::new(Line::from(apply_h_scroll(&entry_names[idx - 1], app.sidebar_scroll_x))))
                         } else {
                             None
                         }
                     } else if idx < entry_names.len() {
-                        Some(ListItem::new(Line::from(entry_names[idx].clone())))
+                        Some(ListItem::new(Line::from(apply_h_scroll(&entry_names[idx], app.sidebar_scroll_x))))
                     } else {
                         None
                     }
@@ -1918,12 +1967,16 @@ fn main() -> io::Result<()> {
                             }
                         }
                         MouseEventKind::ScrollLeft => {
-                            if in_editor {
+                            if in_sidebar {
+                                app.handle_sidebar_horizontal_scroll(x, y, -2);
+                            } else if in_editor {
                                 app.handle_editor_horizontal_scroll(-2);
                             }
                         }
                         MouseEventKind::ScrollRight => {
-                            if in_editor {
+                            if in_sidebar {
+                                app.handle_sidebar_horizontal_scroll(x, y, 2);
+                            } else if in_editor {
                                 app.handle_editor_horizontal_scroll(2);
                             }
                         }
