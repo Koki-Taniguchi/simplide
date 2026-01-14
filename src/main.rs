@@ -27,6 +27,7 @@ use ratatui_image::{
     Resize,
 };
 use std::sync::mpsc::{self, Receiver, Sender};
+use unicode_width::UnicodeWidthChar;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Language {
@@ -448,6 +449,8 @@ struct App {
     line_offsets: Vec<usize>,
     // 最大行幅キャッシュ（文字数）
     max_line_width: usize,
+    // 保存済みの内容（比較用）
+    saved_content: String,
     // カーソル追従を有効にするか
     follow_cursor: bool,
     // 現在のファイルの言語
@@ -526,6 +529,7 @@ impl App {
             buffer_dirty: false,
             line_offsets: Vec::new(),
             max_line_width: 0,
+            saved_content: String::new(),
             follow_cursor: true,
             current_language: None,
             picker,
@@ -564,6 +568,7 @@ impl App {
                 // テキストファイルの場合
                 let content = fs::read_to_string(path).unwrap_or_else(|_| String::new());
                 self.buffer = Rope::from_str(&content);
+                self.saved_content = content;
                 self.current_language = self.syntax.detect_language(path);
                 self.image_state = None;
                 self.is_image_mode = false;
@@ -582,11 +587,17 @@ impl App {
         }
     }
 
-    fn save_file(&self) -> io::Result<()> {
+    fn save_file(&mut self) -> io::Result<()> {
         if let Some(path) = &self.file_path {
-            fs::write(path, self.buffer.to_string())?;
+            let content = self.buffer.to_string();
+            fs::write(path, &content)?;
+            self.saved_content = content;
         }
         Ok(())
+    }
+
+    fn is_unsaved(&self) -> bool {
+        self.buffer.to_string() != self.saved_content
     }
 
     fn file_name(&self) -> String {
@@ -608,6 +619,40 @@ impl App {
         } else {
             len
         }
+    }
+
+    /// カーソル位置までの表示幅を計算（全角文字を考慮）
+    fn cursor_display_col(&self) -> usize {
+        if self.cursor_line >= self.buffer.len_lines() {
+            return 0;
+        }
+        let line = self.buffer.line(self.cursor_line);
+        line.chars()
+            .take(self.cursor_col)
+            .map(|c| c.width().unwrap_or(1))
+            .sum()
+    }
+
+    /// 表示幅から文字インデックスを計算（クリック位置→カーソル位置）
+    fn display_col_to_char_col(&self, line_idx: usize, display_col: usize) -> usize {
+        if line_idx >= self.buffer.len_lines() {
+            return 0;
+        }
+        let line = self.buffer.line(line_idx);
+        let mut current_width = 0;
+        let mut char_col = 0;
+        for ch in line.chars() {
+            if ch == '\n' {
+                break;
+            }
+            let ch_width = ch.width().unwrap_or(1);
+            if current_width + ch_width > display_col {
+                break;
+            }
+            current_width += ch_width;
+            char_col += 1;
+        }
+        char_col
     }
 
     fn clamp_cursor_col(&mut self) {
@@ -668,7 +713,7 @@ impl App {
         let idx = self.cursor_char_idx();
         self.buffer.insert_char(idx, c);
         self.buffer_dirty = true;
-        if c == '\n' {
+                if c == '\n' {
             self.cursor_line += 1;
             self.cursor_col = 0;
         } else {
@@ -683,7 +728,7 @@ impl App {
             let prev_char = self.buffer.char(idx - 1);
             self.buffer.remove(idx - 1..idx);
             self.buffer_dirty = true;
-            if prev_char == '\n' {
+                        if prev_char == '\n' {
                 self.cursor_line -= 1;
                 self.cursor_col = self.current_line_len();
             } else {
@@ -698,7 +743,7 @@ impl App {
         if idx < self.buffer.len_chars() {
             self.buffer.remove(idx..idx + 1);
             self.buffer_dirty = true;
-        }
+                    }
     }
 
     fn move_to_line_start(&mut self) {
@@ -720,7 +765,7 @@ impl App {
             if idx < self.buffer.len_chars() {
                 self.buffer.remove(idx..idx + 1);
                 self.buffer_dirty = true;
-            }
+                            }
         } else {
             // カーソルから行末まで削除
             let start_idx = self.cursor_char_idx();
@@ -729,7 +774,7 @@ impl App {
             if start_idx < end_idx {
                 self.buffer.remove(start_idx..end_idx);
                 self.buffer_dirty = true;
-            }
+                            }
         }
     }
 
@@ -851,8 +896,9 @@ impl App {
                 if x < self.editor_area.x + 1 + ln_width {
                     self.cursor_col = 0;
                 } else {
-                    let clicked_col = (x - self.editor_area.x - 1 - ln_width) as usize + self.horizontal_scroll;
-                    self.cursor_col = clicked_col.min(self.current_line_len());
+                    // クリック位置（表示幅）から文字インデックスに変換
+                    let clicked_display_col = (x - self.editor_area.x - 1 - ln_width) as usize + self.horizontal_scroll;
+                    self.cursor_col = self.display_col_to_char_col(clicked_line, clicked_display_col);
                 }
             }
         }
@@ -1150,13 +1196,14 @@ fn main() -> io::Result<()> {
 
                 let editor = Paragraph::new(lines)
                     .block(Block::default()
-                        .title(format!("{} [Ctrl-S: Save, Ctrl-C: Quit]", app.file_name()))
+                        .title(format!("{}{} [Ctrl-S: Save, Ctrl-C: Quit]", app.file_name(), if app.is_unsaved() { " *" } else { "" }))
                         .borders(Borders::ALL));
                 frame.render_widget(editor, chunks[1]);
 
-                // カーソル表示（行番号と横スクロールを考慮）
+                // カーソル表示（行番号と横スクロール、全角文字幅を考慮）
                 let ln_width = app.line_number_width() as u16;
-                let cursor_x = chunks[1].x + 1 + ln_width + app.cursor_col.saturating_sub(app.horizontal_scroll) as u16;
+                let display_col = app.cursor_display_col();
+                let cursor_x = chunks[1].x + 1 + ln_width + display_col.saturating_sub(app.horizontal_scroll) as u16;
                 let cursor_y = chunks[1].y + 1 + app.cursor_line.saturating_sub(app.scroll_offset) as u16;
                 frame.set_cursor_position((cursor_x, cursor_y));
             }
@@ -1177,11 +1224,16 @@ fn main() -> io::Result<()> {
 
             let should_break = match event::read()? {
                 Event::Key(key) => {
-                    if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    // Command-S (macOS) または Ctrl-S で保存
+                    if (key.modifiers.contains(KeyModifiers::SUPER) || key.modifiers.contains(KeyModifiers::CONTROL))
+                        && key.code == KeyCode::Char('s')
+                    {
+                        let _ = app.save_file();
+                        false
+                    } else if key.modifiers.contains(KeyModifiers::CONTROL) {
                         // Emacs keybindings (Ctrl+key)
                         match key.code {
                             KeyCode::Char('c') => true,
-                            KeyCode::Char('s') => { let _ = app.save_file(); false }
                             KeyCode::Char('a') => { app.move_to_line_start(); false }
                             KeyCode::Char('e') => { app.move_to_line_end(); false }
                             KeyCode::Char('f') => { app.move_right(); false }
