@@ -14,7 +14,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
     Terminal,
 };
 use ropey::Rope;
@@ -483,6 +483,14 @@ struct App {
     tab_area: Rect,
     // Git branch
     git_branch: Option<String>,
+    // 確認ダイアログ
+    confirm_dialog: Option<ConfirmAction>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ConfirmAction {
+    Quit,
+    CloseTab,
 }
 
 fn get_git_branch(dir: &PathBuf) -> Option<String> {
@@ -572,7 +580,18 @@ impl App {
             tabs: Vec::new(),
             tab_area: Rect::default(),
             git_branch,
+            confirm_dialog: None,
         }
+    }
+
+    /// 未保存のタブがあるかチェック
+    fn has_unsaved_tabs(&self) -> bool {
+        // 現在のファイルが未保存
+        if self.is_unsaved() {
+            return true;
+        }
+        // 他のタブに未保存がある
+        !self.unsaved_files.is_empty()
     }
 
     fn read_dir(path: &PathBuf) -> Vec<PathBuf> {
@@ -741,25 +760,40 @@ impl App {
         }
     }
 
-    /// タブを閉じる
+    /// タブを閉じる（未保存なら確認ダイアログを表示）
     fn close_current_tab(&mut self) {
+        if self.is_unsaved() {
+            self.confirm_dialog = Some(ConfirmAction::CloseTab);
+        } else {
+            self.force_close_current_tab();
+        }
+    }
+
+    /// タブを強制的に閉じる（確認なし）
+    fn force_close_current_tab(&mut self) {
         if let Some(current) = &self.file_path.clone() {
-            // 未保存でなければタブから削除
-            if !self.is_unsaved() {
-                if let Some(idx) = self.tabs.iter().position(|p| p == current) {
-                    self.tabs.remove(idx);
-                    self.unsaved_files.remove(current);
-                    // 別のタブがあれば切り替え
-                    if !self.tabs.is_empty() {
-                        let new_idx = idx.min(self.tabs.len() - 1);
-                        let new_path = self.tabs[new_idx].clone();
-                        self.open_file(&new_path);
-                    } else {
-                        // タブがなくなったらクリア
-                        self.file_path = None;
-                        self.buffer = Rope::new();
-                        self.saved_content.clear();
-                    }
+            if let Some(idx) = self.tabs.iter().position(|p| p == current) {
+                self.tabs.remove(idx);
+                self.unsaved_files.remove(current);
+                // 別のタブがあれば切り替え
+                if !self.tabs.is_empty() {
+                    let new_idx = idx.min(self.tabs.len() - 1);
+                    let new_path = self.tabs[new_idx].clone();
+                    self.open_file(&new_path);
+                } else {
+                    // タブがなくなったらクリア
+                    self.file_path = None;
+                    self.buffer = Rope::new();
+                    self.saved_content.clear();
+                    self.source_cache.clear();
+                    self.highlight_cache = None;
+                    self.line_offsets.clear();
+                    self.max_line_width = 0;
+                    self.buffer_dirty = true;
+                    self.cursor_line = 0;
+                    self.cursor_col = 0;
+                    self.scroll_offset = 0;
+                    self.horizontal_scroll = 0;
                 }
             }
         }
@@ -1441,6 +1475,32 @@ fn main() -> io::Result<()> {
                 let cursor_y = editor_area.y + 1 + app.cursor_line.saturating_sub(app.scroll_offset) as u16;
                 frame.set_cursor_position((cursor_x, cursor_y));
             }
+
+            // 確認ダイアログ
+            if let Some(action) = app.confirm_dialog {
+                let dialog_width = 40u16;
+                let dialog_height = 5u16;
+                let area = frame.area();
+                let dialog_area = Rect::new(
+                    area.x + (area.width.saturating_sub(dialog_width)) / 2,
+                    area.y + (area.height.saturating_sub(dialog_height)) / 2,
+                    dialog_width.min(area.width),
+                    dialog_height.min(area.height),
+                );
+                let message = match action {
+                    ConfirmAction::Quit => "  Quit? Unsaved changes will be lost.",
+                    ConfirmAction::CloseTab => "  Close tab? Changes will be lost.",
+                };
+                let dialog = Paragraph::new(vec![
+                    Line::from(""),
+                    Line::from(message),
+                    Line::from("  (Y/N)"),
+                ])
+                .block(Block::default().title(" Confirm ").borders(Borders::ALL))
+                .style(Style::default().bg(Color::DarkGray));
+                frame.render_widget(Clear, dialog_area);
+                frame.render_widget(dialog, dialog_area);
+            }
         })?;
 
         // イベントをバッチ処理（溜まっているイベントを全て処理してから描画）
@@ -1458,8 +1518,27 @@ fn main() -> io::Result<()> {
 
             let should_break = match event::read()? {
                 Event::Key(key) => {
+                    // 確認ダイアログ中の場合
+                    if let Some(action) = app.confirm_dialog {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                app.confirm_dialog = None;
+                                match action {
+                                    ConfirmAction::Quit => true,
+                                    ConfirmAction::CloseTab => {
+                                        app.force_close_current_tab();
+                                        false
+                                    }
+                                }
+                            }
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                                app.confirm_dialog = None;
+                                false
+                            }
+                            _ => false,
+                        }
                     // Command-S (macOS) または Ctrl-S で保存
-                    if (key.modifiers.contains(KeyModifiers::SUPER) || key.modifiers.contains(KeyModifiers::CONTROL))
+                    } else if (key.modifiers.contains(KeyModifiers::SUPER) || key.modifiers.contains(KeyModifiers::CONTROL))
                         && key.code == KeyCode::Char('s')
                     {
                         let _ = app.save_file();
@@ -1467,7 +1546,14 @@ fn main() -> io::Result<()> {
                     } else if key.modifiers.contains(KeyModifiers::CONTROL) {
                         // Emacs keybindings (Ctrl+key)
                         match key.code {
-                            KeyCode::Char('c') => true,
+                            KeyCode::Char('c') => {
+                                if app.has_unsaved_tabs() {
+                                    app.confirm_dialog = Some(ConfirmAction::Quit);
+                                    false
+                                } else {
+                                    true
+                                }
+                            }
                             KeyCode::Char('a') => { app.move_to_line_start(); false }
                             KeyCode::Char('e') => { app.move_to_line_end(); false }
                             KeyCode::Char('f') => { app.move_right(); false }
