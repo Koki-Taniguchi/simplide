@@ -121,6 +121,7 @@ const HIGHLIGHT_NAMES: &[&str] = &[
     "text.strong",
     "punctuation.special",
     "punctuation.delimiter",
+    "punctuation.bracket",
     "string.escape",
     "markup.heading",
     "markup.link",
@@ -133,6 +134,7 @@ const HIGHLIGHT_NAMES: &[&str] = &[
     "module",
     "parameter",
     "field",
+    "constant.builtin",
 ];
 
 fn highlight_color(highlight: Highlight) -> Color {
@@ -158,6 +160,7 @@ fn highlight_color(highlight: Highlight) -> Color {
         Some(&"text.strong") => Color::LightRed,
         Some(&"punctuation.special") => Color::Magenta,
         Some(&"punctuation.delimiter") => Color::DarkGray,
+        Some(&"punctuation.bracket") => Color::White,
         Some(&"string.escape") => Color::Red,
         Some(&"markup.heading") => Color::Yellow,
         Some(&"markup.link") => Color::Cyan,
@@ -170,6 +173,7 @@ fn highlight_color(highlight: Highlight) -> Color {
         Some(&"module") => Color::Yellow,
         Some(&"parameter") => Color::White,
         Some(&"field") => Color::Blue,
+        Some(&"constant.builtin") => Color::Cyan,
         _ => Color::White,
     }
 }
