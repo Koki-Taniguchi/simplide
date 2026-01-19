@@ -1705,8 +1705,16 @@ impl App {
             let byte_pos = line_start + byte_offset;
             let fg_color = colors.get(byte_pos).copied().unwrap_or(Color::White);
 
+            // タブ文字は8スペースとして扱う
+            let char_width = if ch == '\t' { 8 } else { ch.width().unwrap_or(1) };
+
             // 横スクロール範囲内の文字のみ処理
             if char_index >= self.horizontal_scroll && visible_chars < visible_width {
+                // 文字幅を加算して溢れる場合はスキップ
+                if visible_chars + char_width > visible_width {
+                    break;
+                }
+
                 // ハイライト優先度: 検索マッチ > 選択範囲 > 通常
                 let style = if self.is_current_match(line_idx, char_index) {
                     Style::default().fg(Color::Black).bg(Color::Yellow)
@@ -1730,7 +1738,7 @@ impl App {
                     current_style = Some(style);
                 }
                 current_text.push(ch);
-                visible_chars += 1;
+                visible_chars += char_width;
             }
 
             byte_offset += ch.len_utf8();
@@ -1754,7 +1762,15 @@ impl App {
         let mut visible_chars = 0;
 
         for ch in line_text.chars() {
+            // タブ文字は8スペースとして扱う
+            let char_width = if ch == '\t' { 8 } else { ch.width().unwrap_or(1) };
+
             if char_index >= self.horizontal_scroll && visible_chars < visible_width {
+                // 文字幅を加算して溢れる場合はスキップ
+                if visible_chars + char_width > visible_width {
+                    break;
+                }
+
                 // ハイライト優先度: 検索マッチ > 選択範囲 > 通常
                 let style = if self.is_current_match(line_idx, char_index) {
                     Style::default().fg(Color::Black).bg(Color::Yellow)
@@ -1778,7 +1794,7 @@ impl App {
                     current_style = Some(style);
                 }
                 current_text.push(ch);
-                visible_chars += 1;
+                visible_chars += char_width;
             }
             char_index += 1;
         }
@@ -1811,6 +1827,7 @@ fn main() -> io::Result<()> {
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    terminal.clear()?;
 
     let mut app = App::new(initial_path);
 
