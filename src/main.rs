@@ -2019,7 +2019,7 @@ fn main() -> io::Result<()> {
                 let lines = app.get_highlighted_lines(visible_height, visible_width);
 
                 let editor_block = Block::default()
-                    .title(format!("{}{} [C-S:Save C-W:Close C-]:Tab C-C:Quit]", app.file_name(), if app.is_unsaved() { " *" } else { "" }))
+                    .title(format!("{}{} [C-s:Save C-w:Close C-]:Tab C-c:Quit]", app.file_name(), if app.is_unsaved() { " *" } else { "" }))
                     .borders(Borders::ALL);
                 let editor = Paragraph::new(lines).block(editor_block);
                 frame.render_widget(editor, editor_area);
