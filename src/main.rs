@@ -6,7 +6,7 @@ use std::panic;
 use std::path::PathBuf;
 
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
+    event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -29,6 +29,31 @@ use ratatui_image::{
 };
 use std::sync::mpsc::{self, Receiver, Sender};
 use unicode_width::UnicodeWidthChar;
+
+/// Base64エンコード（OSC 52用）
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::new();
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as usize;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as usize;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as usize;
+
+        result.push(ALPHABET[b0 >> 2] as char);
+        result.push(ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)] as char);
+        if chunk.len() > 1 {
+            result.push(ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(ALPHABET[b2 & 0x3f] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum Language {
@@ -95,7 +120,7 @@ impl Config {
 
 fn reset_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste);
 }
 
 // ハイライト名とカラーのマッピング
@@ -507,6 +532,50 @@ struct UnsavedFile {
     horizontal_scroll: usize,
 }
 
+/// テキスト選択範囲を表す構造体
+#[derive(Clone, Copy, Debug)]
+struct Selection {
+    /// 選択開始位置（行、列）
+    start: (usize, usize),
+    /// 選択終了位置（行、列）
+    end: (usize, usize),
+}
+
+impl Selection {
+    fn new(line: usize, col: usize) -> Self {
+        Self {
+            start: (line, col),
+            end: (line, col),
+        }
+    }
+
+    /// 正規化された範囲を取得（startが常にendより前になるように）
+    fn normalized(&self) -> ((usize, usize), (usize, usize)) {
+        if self.start.0 < self.end.0 || (self.start.0 == self.end.0 && self.start.1 <= self.end.1) {
+            (self.start, self.end)
+        } else {
+            (self.end, self.start)
+        }
+    }
+
+    /// 指定位置が選択範囲内かどうか
+    fn contains(&self, line: usize, col: usize) -> bool {
+        let ((start_line, start_col), (end_line, end_col)) = self.normalized();
+        if line < start_line || line > end_line {
+            return false;
+        }
+        if line == start_line && line == end_line {
+            col >= start_col && col < end_col
+        } else if line == start_line {
+            col >= start_col
+        } else if line == end_line {
+            col < end_col
+        } else {
+            true
+        }
+    }
+}
+
 struct App {
     root_dir: PathBuf,
     current_dir: PathBuf,
@@ -562,6 +631,11 @@ struct App {
     search_query: String,
     search_matches: Vec<(usize, usize)>,  // (line, col)
     search_index: usize,
+    // テキスト選択
+    selection: Option<Selection>,
+    is_selecting: bool,
+    // コピーボタン表示位置（画面座標）
+    copy_button_area: Option<Rect>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -687,6 +761,9 @@ impl App {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_index: 0,
+            selection: None,
+            is_selecting: false,
+            copy_button_area: None,
         };
 
         // 初期ファイルがあれば開く
@@ -1337,6 +1414,152 @@ impl App {
         }
     }
 
+    /// エディタ領域内の座標を行・列に変換
+    fn screen_to_editor_pos(&self, x: u16, y: u16) -> Option<(usize, usize)> {
+        let ln_width = self.line_number_width() as u16;
+        if x >= self.editor_area.x + 1 + ln_width
+            && x < self.editor_area.x + self.editor_area.width - 1
+            && y >= self.editor_area.y + 1
+            && y < self.editor_area.y + self.editor_area.height - 1
+        {
+            let line = (y - self.editor_area.y - 1) as usize + self.scroll_offset;
+            if line < self.buffer.len_lines() {
+                let clicked_display_col = (x - self.editor_area.x - 1 - ln_width) as usize + self.horizontal_scroll;
+                let col = self.display_col_to_char_col(line, clicked_display_col);
+                return Some((line, col));
+            }
+        }
+        None
+    }
+
+    /// 選択開始
+    fn start_selection(&mut self, line: usize, col: usize) {
+        self.selection = Some(Selection::new(line, col));
+        self.is_selecting = true;
+    }
+
+    /// 選択更新
+    fn update_selection(&mut self, line: usize, col: usize) {
+        if let Some(ref mut sel) = self.selection {
+            sel.end = (line, col);
+        }
+    }
+
+    /// 選択終了
+    fn end_selection(&mut self) {
+        self.is_selecting = false;
+        // 選択範囲が空なら選択解除
+        if let Some(sel) = self.selection {
+            if sel.start == sel.end {
+                self.selection = None;
+                self.copy_button_area = None;
+            } else {
+                // コピーボタンの位置を計算（選択終端の右側）
+                self.update_copy_button_position();
+            }
+        }
+    }
+
+    /// コピーボタンの位置を更新
+    fn update_copy_button_position(&mut self) {
+        if let Some(sel) = self.selection {
+            let (_, (end_line, end_col)) = sel.normalized();
+            let ln_width = self.line_number_width();
+
+            // 画面上の位置を計算
+            if end_line >= self.scroll_offset {
+                let screen_line = end_line - self.scroll_offset;
+                let screen_y = self.editor_area.y + 1 + screen_line as u16;
+
+                // 列位置を計算（表示幅を考慮）
+                let display_col = if end_col >= self.horizontal_scroll {
+                    end_col - self.horizontal_scroll
+                } else {
+                    0
+                };
+                let screen_x = self.editor_area.x + 1 + ln_width as u16 + display_col as u16;
+
+                // ボタンサイズ: [Copy]
+                let button_width = 6u16;
+                let button_height = 1u16;
+
+                // 画面内に収まるように調整
+                let x = screen_x.min(self.editor_area.x + self.editor_area.width - button_width - 1);
+                let y = screen_y.min(self.editor_area.y + self.editor_area.height - button_height - 1);
+
+                self.copy_button_area = Some(Rect::new(x, y, button_width, button_height));
+            } else {
+                self.copy_button_area = None;
+            }
+        } else {
+            self.copy_button_area = None;
+        }
+    }
+
+    /// 選択解除
+    fn clear_selection(&mut self) {
+        // コピーボタンが表示されていた場合は画面クリアが必要
+        if self.copy_button_area.is_some() {
+            self.needs_clear = true;
+        }
+        self.selection = None;
+        self.copy_button_area = None;
+        self.is_selecting = false;
+    }
+
+    /// 選択範囲のテキストを取得
+    fn get_selected_text(&self) -> Option<String> {
+        let sel = self.selection?;
+        let ((start_line, start_col), (end_line, end_col)) = sel.normalized();
+
+        let mut result = String::new();
+        for line_idx in start_line..=end_line {
+            if line_idx >= self.buffer.len_lines() {
+                break;
+            }
+            let line = self.buffer.line(line_idx);
+            // Ropeyのline()は改行を含むので除去
+            let line_str: String = line.chars()
+                .filter(|&c| c != '\n' && c != '\r')
+                .collect();
+            let line_len = line_str.chars().count();
+
+            let start = if line_idx == start_line { start_col } else { 0 };
+            let end = if line_idx == end_line { end_col.min(line_len) } else { line_len };
+
+            if start <= line_len {
+                let chars: Vec<char> = line_str.chars().collect();
+                let actual_end = end.min(chars.len());
+                if start < actual_end {
+                    let slice: String = chars[start..actual_end].iter().collect();
+                    result.push_str(&slice);
+                }
+            }
+
+            // 最終行以外は改行を追加
+            if line_idx < end_line {
+                result.push('\n');
+            }
+        }
+
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
+        }
+    }
+
+    /// OSC 52でクリップボードにコピー
+    fn copy_to_clipboard_osc52(&self, text: &str) {
+        use std::io::Write;
+        let encoded = base64_encode(text.as_bytes());
+        // OSC 52: システムクリップボードにコピー
+        // \x1b]52;c;<base64>\x07
+        let osc52 = format!("\x1b]52;c;{}\x07", encoded);
+        let _ = std::io::stdout().write_all(osc52.as_bytes());
+        let _ = std::io::stdout().flush();
+    }
+
     fn update_cache(&mut self) {
         if !self.buffer_dirty {
             return;
@@ -1471,6 +1694,15 @@ impl App {
         false
     }
 
+    /// 指定位置が選択範囲内かどうかチェック
+    fn is_in_selection(&self, line_idx: usize, col: usize) -> bool {
+        if let Some(ref sel) = self.selection {
+            sel.contains(line_idx, col)
+        } else {
+            false
+        }
+    }
+
     fn build_spans_from_colors(&self, line_text: &str, line_start: usize, colors: &[Color], visible_width: usize, line_idx: usize) -> Vec<Span<'static>> {
         if line_text.is_empty() {
             return vec![];
@@ -1489,11 +1721,13 @@ impl App {
 
             // 横スクロール範囲内の文字のみ処理
             if char_index >= self.horizontal_scroll && visible_chars < visible_width {
-                // 検索マッチのハイライト
+                // ハイライト優先度: 検索マッチ > 選択範囲 > 通常
                 let style = if self.is_current_match(line_idx, char_index) {
                     Style::default().fg(Color::Black).bg(Color::Yellow)
                 } else if self.is_in_search_match(line_idx, char_index) {
                     Style::default().fg(fg_color).bg(Color::DarkGray)
+                } else if self.is_in_selection(line_idx, char_index) {
+                    Style::default().fg(Color::White).bg(Color::Blue)
                 } else {
                     Style::default().fg(fg_color)
                 };
@@ -1535,10 +1769,13 @@ impl App {
 
         for ch in line_text.chars() {
             if char_index >= self.horizontal_scroll && visible_chars < visible_width {
+                // ハイライト優先度: 検索マッチ > 選択範囲 > 通常
                 let style = if self.is_current_match(line_idx, char_index) {
                     Style::default().fg(Color::Black).bg(Color::Yellow)
                 } else if self.is_in_search_match(line_idx, char_index) {
                     Style::default().bg(Color::DarkGray)
+                } else if self.is_in_selection(line_idx, char_index) {
+                    Style::default().fg(Color::White).bg(Color::Blue)
                 } else {
                     Style::default()
                 };
@@ -1585,7 +1822,7 @@ fn main() -> io::Result<()> {
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1846,6 +2083,19 @@ fn main() -> io::Result<()> {
                 } else {
                     frame.set_cursor_position((cursor_x, cursor_y));
                 }
+
+                // コピーボタン表示
+                if let Some(btn_area) = app.copy_button_area {
+                    if btn_area.x >= editor_area.x && btn_area.y >= editor_area.y
+                        && btn_area.x + btn_area.width <= editor_area.x + editor_area.width
+                        && btn_area.y + btn_area.height <= editor_area.y + editor_area.height
+                    {
+                        frame.render_widget(Clear, btn_area);
+                        let copy_btn = Paragraph::new(" Copy ")
+                            .style(Style::default().bg(Color::Green).fg(Color::Black));
+                        frame.render_widget(copy_btn, btn_area);
+                    }
+                }
             }
 
             // 確認ダイアログ
@@ -1985,11 +2235,23 @@ fn main() -> io::Result<()> {
                     {
                         let _ = app.save_file();
                         false
+                    // Command-C (macOS) でコピー
+                    } else if key.modifiers.contains(KeyModifiers::SUPER) && key.code == KeyCode::Char('c') {
+                        if let Some(text) = app.get_selected_text() {
+                            app.copy_to_clipboard_osc52(&text);
+                        }
+                        false
                     } else if key.modifiers.contains(KeyModifiers::CONTROL) {
                         // Emacs keybindings (Ctrl+key)
                         match key.code {
                             KeyCode::Char('c') => {
-                                if app.has_unsaved_tabs() {
+                                // 選択範囲がある場合はコピー、ない場合は終了
+                                if app.selection.is_some() {
+                                    if let Some(text) = app.get_selected_text() {
+                                        app.copy_to_clipboard_osc52(&text);
+                                    }
+                                    false
+                                } else if app.has_unsaved_tabs() {
                                     app.confirm_dialog = Some(ConfirmAction::Quit);
                                     false
                                 } else {
@@ -2033,14 +2295,18 @@ fn main() -> io::Result<()> {
                         false
                     } else {
                         match key.code {
-                            KeyCode::Up => app.move_up(),
-                            KeyCode::Down => app.move_down(),
-                            KeyCode::Left => app.move_left(),
-                            KeyCode::Right => app.move_right(),
-                            KeyCode::Backspace => app.delete_char_backspace(),
-                            KeyCode::Delete => app.delete_char_delete(),
-                            KeyCode::Enter => app.insert_char('\n'),
-                            KeyCode::Char(c) => app.insert_char(c),
+                            KeyCode::Esc => {
+                                // 選択解除
+                                app.clear_selection();
+                            }
+                            KeyCode::Up => { app.clear_selection(); app.move_up(); }
+                            KeyCode::Down => { app.clear_selection(); app.move_down(); }
+                            KeyCode::Left => { app.clear_selection(); app.move_left(); }
+                            KeyCode::Right => { app.clear_selection(); app.move_right(); }
+                            KeyCode::Backspace => { app.clear_selection(); app.delete_char_backspace(); }
+                            KeyCode::Delete => { app.clear_selection(); app.delete_char_delete(); }
+                            KeyCode::Enter => { app.clear_selection(); app.insert_char('\n'); }
+                            KeyCode::Char(c) => { app.clear_selection(); app.insert_char(c); }
                             _ => {}
                         }
                         false
@@ -2060,9 +2326,52 @@ fn main() -> io::Result<()> {
 
                     match mouse.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
-                            app.handle_tab_click(x, y);
-                            app.handle_sidebar_click(x, y);
-                            app.handle_editor_click(x, y);
+                            // コピーボタンのクリック判定
+                            let clicked_copy_button = if let Some(btn_area) = app.copy_button_area {
+                                x >= btn_area.x && x < btn_area.x + btn_area.width
+                                    && y >= btn_area.y && y < btn_area.y + btn_area.height
+                            } else {
+                                false
+                            };
+
+                            if clicked_copy_button {
+                                // コピーボタンクリック：OSC 52でコピーして選択解除
+                                if let Some(text) = app.get_selected_text() {
+                                    app.copy_to_clipboard_osc52(&text);
+                                }
+                                app.clear_selection();
+                            } else {
+                                app.handle_tab_click(x, y);
+                                app.handle_sidebar_click(x, y);
+                                // エディタ領域でのクリックは選択開始
+                                if in_editor {
+                                    // 既存の選択を解除
+                                    app.clear_selection();
+                                    // クリック位置にカーソル移動
+                                    app.handle_editor_click(x, y);
+                                    // 選択開始
+                                    if let Some((line, col)) = app.screen_to_editor_pos(x, y) {
+                                        app.start_selection(line, col);
+                                    }
+                                } else {
+                                    app.clear_selection();
+                                }
+                            }
+                        }
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            // エディタ領域でのドラッグは選択範囲を更新
+                            if in_editor && app.is_selecting {
+                                if let Some((line, col)) = app.screen_to_editor_pos(x, y) {
+                                    app.update_selection(line, col);
+                                    // カーソルも移動
+                                    app.cursor_line = line;
+                                    app.cursor_col = col;
+                                }
+                            }
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            // 選択終了
+                            app.end_selection();
                         }
                         MouseEventKind::ScrollUp => {
                             if in_sidebar {
@@ -2093,6 +2402,14 @@ fn main() -> io::Result<()> {
                             }
                         }
                         _ => {}
+                    }
+                    false
+                }
+                Event::Paste(text) => {
+                    // ペーストされたテキストを挿入
+                    app.clear_selection();
+                    for c in text.chars() {
+                        app.insert_char(c);
                     }
                     false
                 }
@@ -2139,7 +2456,7 @@ fn main() -> io::Result<()> {
 
             if should_break {
                 disable_raw_mode()?;
-                execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture)?;
+                execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste)?;
                 return Ok(());
             }
         }
