@@ -4,6 +4,7 @@ use std::fs;
 use std::io;
 use std::panic;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use crossterm::{
     event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
@@ -530,6 +531,10 @@ struct UnsavedFile {
     cursor_col: usize,
     scroll_offset: usize,
     horizontal_scroll: usize,
+    /// ファイルを開いた時の更新日時（外部変更検知用）
+    modified_time: Option<SystemTime>,
+    /// 外部で変更されたフラグ
+    externally_modified: bool,
 }
 
 /// テキスト選択範囲を表す構造体
@@ -602,6 +607,8 @@ struct App {
     max_line_width: usize,
     // 保存済みの内容（比較用）
     saved_content: String,
+    // ファイルの更新日時（外部変更検知用）
+    file_modified_time: Option<SystemTime>,
     // カーソル追従を有効にするか
     follow_cursor: bool,
     // 現在のファイルの言語
@@ -729,6 +736,7 @@ impl App {
             line_offsets: Vec::new(),
             max_line_width: 0,
             saved_content: String::new(),
+            file_modified_time: None,
             follow_cursor: true,
             current_language: None,
             picker,
@@ -778,9 +786,14 @@ impl App {
         entries
     }
 
+    /// ファイルの更新日時を取得
+    fn get_file_modified_time(path: &PathBuf) -> Option<SystemTime> {
+        fs::metadata(path).ok().and_then(|m| m.modified().ok())
+    }
+
     fn open_file(&mut self, path: &PathBuf) {
         if path.is_file() {
-            // 現在のファイルの状態を保存（未保存の場合のみ）
+            // 現在のファイルの状態を保存
             if let Some(current_path) = &self.file_path.clone() {
                 if !self.is_image_mode {
                     if self.is_unsaved() {
@@ -792,6 +805,8 @@ impl App {
                             cursor_col: self.cursor_col,
                             scroll_offset: self.scroll_offset,
                             horizontal_scroll: self.horizontal_scroll,
+                            modified_time: self.file_modified_time,
+                            externally_modified: false,
                         });
                     } else {
                         // 保存済みならメモリから削除
@@ -803,6 +818,9 @@ impl App {
             self.file_path = Some(path.clone());
             self.needs_clear = true;
 
+            // 現在のディスク上のファイルの更新日時を取得
+            let current_disk_modified = Self::get_file_modified_time(path);
+
             if is_image_file(path) {
                 // 画像ファイルの場合 - 非同期でデコード
                 let _ = self.decode_tx.send((path.clone(), self.picker.clone(), self.image_tx.clone()));
@@ -812,19 +830,34 @@ impl App {
                 // テキストバッファはクリア
                 self.buffer = Rope::new();
                 self.saved_content.clear();
+                self.file_modified_time = current_disk_modified;
                 self.current_language = None;
                 self.cursor_line = 0;
                 self.cursor_col = 0;
                 self.scroll_offset = 0;
                 self.horizontal_scroll = 0;
-            } else if let Some(unsaved) = self.unsaved_files.remove(path) {
+            } else if let Some(mut unsaved) = self.unsaved_files.remove(path) {
                 // 未保存の状態があれば復元
+                // 外部で変更されたか確認
+                let was_externally_modified = match (unsaved.modified_time, current_disk_modified) {
+                    (Some(saved_time), Some(disk_time)) => disk_time > saved_time,
+                    _ => false,
+                };
+
+                if was_externally_modified {
+                    // 外部変更があった場合、フラグを立てて新しい内容をsaved_contentに
+                    let new_content = fs::read_to_string(path).unwrap_or_else(|_| String::new());
+                    unsaved.saved_content = new_content;
+                    unsaved.externally_modified = true;
+                }
+
                 self.buffer = unsaved.buffer;
                 self.saved_content = unsaved.saved_content;
                 self.cursor_line = unsaved.cursor_line;
                 self.cursor_col = unsaved.cursor_col;
                 self.scroll_offset = unsaved.scroll_offset;
                 self.horizontal_scroll = unsaved.horizontal_scroll;
+                self.file_modified_time = current_disk_modified;
                 self.current_language = self.syntax.detect_language(path);
                 self.image_state = None;
                 self.is_image_mode = false;
@@ -834,6 +867,7 @@ impl App {
                 let content = fs::read_to_string(path).unwrap_or_else(|_| String::new());
                 self.buffer = Rope::from_str(&content);
                 self.saved_content = content;
+                self.file_modified_time = current_disk_modified;
                 self.current_language = self.syntax.detect_language(path);
                 self.image_state = None;
                 self.is_image_mode = false;
@@ -857,6 +891,8 @@ impl App {
             let content = self.buffer.to_string();
             fs::write(path, &content)?;
             self.saved_content = content;
+            // 保存後の更新日時を記録
+            self.file_modified_time = Self::get_file_modified_time(path);
         }
         Ok(())
     }
@@ -1291,6 +1327,9 @@ impl App {
             && y > self.sidebar_area.y
             && y < self.sidebar_area.y + self.sidebar_area.height.saturating_sub(1)
         {
+            // サイドバークリック時にディレクトリ内容を更新（外部変更の反映）
+            self.refresh_directory();
+
             let visible_index = (y - self.sidebar_area.y - 1) as usize;
             let index = visible_index + self.sidebar_scroll;
             let show_parent = self.current_dir != self.root_dir;
@@ -1310,12 +1349,20 @@ impl App {
                         self.current_dir = path;
                         self.entries = Self::read_dir(&self.current_dir);
                         self.sidebar_scroll = 0;
-                    self.sidebar_scroll_x = 0;
+                        self.sidebar_scroll_x = 0;
                     } else {
                         self.open_file(&path);
                     }
                 }
             }
+        }
+    }
+
+    /// 現在のディレクトリ内容を再読み込み
+    fn refresh_directory(&mut self) {
+        let new_entries = Self::read_dir(&self.current_dir);
+        if new_entries != self.entries {
+            self.entries = new_entries;
         }
     }
 
