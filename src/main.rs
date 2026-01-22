@@ -1604,23 +1604,30 @@ impl App {
             self.source_cache.push_str(chunk);
         }
 
-        // 行オフセットキャッシュを構築し、最大行幅を計算
+        // 行オフセットキャッシュを構築し、最大行幅を計算（表示幅ベース）
         self.line_offsets.clear();
         self.line_offsets.push(0);
         self.max_line_width = 0;
-        let mut current_line_chars = 0usize;
-        for (i, byte) in self.source_cache.bytes().enumerate() {
-            if byte == b'\n' {
-                self.max_line_width = self.max_line_width.max(current_line_chars);
-                self.line_offsets.push(i + 1);
-                current_line_chars = 0;
-            } else if (byte & 0b11000000) != 0b10000000 {
-                // UTF-8の先頭バイトのみカウント（継続バイトは除外）
-                current_line_chars += 1;
+        let mut current_line_width = 0usize;
+        let mut byte_pos = 0usize;
+        for ch in self.source_cache.chars() {
+            if ch == '\n' {
+                self.max_line_width = self.max_line_width.max(current_line_width);
+                byte_pos += ch.len_utf8();
+                self.line_offsets.push(byte_pos);
+                current_line_width = 0;
+            } else if ch == '\t' {
+                // タブは4スペース相当として計算
+                current_line_width += 4;
+                byte_pos += 1;
+            } else {
+                // 表示幅を使用（全角=2, 半角=1）
+                current_line_width += ch.width().unwrap_or(1);
+                byte_pos += ch.len_utf8();
             }
         }
         // 最終行（改行で終わらない場合）
-        self.max_line_width = self.max_line_width.max(current_line_chars);
+        self.max_line_width = self.max_line_width.max(current_line_width);
 
         // ハイライトキャッシュを更新
         if let Some(lang) = self.current_language {
