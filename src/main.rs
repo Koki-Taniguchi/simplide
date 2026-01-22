@@ -458,22 +458,22 @@ impl SyntaxHighlighter {
         // configsへの参照を取得（borrow checkerのためにここで分離）
         let configs = &self.configs;
 
-        // injection callback - 言語名から設定を解決
+        // injection callback - 言語名から設定を解決（エイリアス対応）
         let injection_callback = |lang_name: &str| -> Option<&HighlightConfiguration> {
             let lang = match lang_name {
-                "rust" => Some(Language::Rust),
-                "javascript" | "js" => Some(Language::JavaScript),
+                "rust" | "rs" => Some(Language::Rust),
+                "javascript" | "js" | "jsx" => Some(Language::JavaScript),
                 "typescript" | "ts" => Some(Language::TypeScript),
                 "tsx" => Some(Language::Tsx),
-                "go" => Some(Language::Go),
-                "python" => Some(Language::Python),
-                "json" => Some(Language::Json),
+                "go" | "golang" => Some(Language::Go),
+                "python" | "py" | "python3" => Some(Language::Python),
+                "json" | "jsonc" => Some(Language::Json),
                 "toml" => Some(Language::Toml),
                 "yaml" | "yml" => Some(Language::Yaml),
-                "markdown" => Some(Language::Markdown),
+                "markdown" | "md" => Some(Language::Markdown),
                 "markdown_inline" => Some(Language::MarkdownInline),
                 "php" => Some(Language::Php),
-                "make" | "makefile" => Some(Language::Make),
+                "make" | "makefile" | "Makefile" => Some(Language::Make),
                 "hcl" | "terraform" | "tf" => Some(Language::Hcl),
                 _ => None,
             };
@@ -487,6 +487,7 @@ impl SyntaxHighlighter {
 
         let mut colors = vec![Color::White; source.len()];
         let mut current_color = Color::White;
+        let mut color_stack: Vec<Color> = Vec::new();
 
         for event in highlights {
             match event {
@@ -496,10 +497,11 @@ impl SyntaxHighlighter {
                     }
                 }
                 Ok(HighlightEvent::HighlightStart(h)) => {
+                    color_stack.push(current_color);
                     current_color = highlight_color(h);
                 }
                 Ok(HighlightEvent::HighlightEnd) => {
-                    current_color = Color::White;
+                    current_color = color_stack.pop().unwrap_or(Color::White);
                 }
                 Err(_) => break,
             }
