@@ -1531,6 +1531,22 @@ impl App {
         }
     }
 
+    /// 全選択
+    fn select_all(&mut self) {
+        let last_line = self.buffer.len_lines().saturating_sub(1);
+        let last_col = if last_line < self.buffer.len_lines() {
+            let line = self.buffer.line(last_line);
+            line.chars().filter(|&c| c != '\n' && c != '\r').count()
+        } else {
+            0
+        };
+        self.selection = Some(Selection {
+            start: (0, 0),
+            end: (last_line, last_col),
+        });
+        self.is_selecting = false;
+    }
+
     /// 選択解除
     fn clear_selection(&mut self) {
         // コピーボタンが表示されていた場合は画面クリアが必要
@@ -1540,6 +1556,48 @@ impl App {
         self.selection = None;
         self.copy_button_area = None;
         self.is_selecting = false;
+    }
+
+    /// 選択範囲を削除（選択範囲がある場合はtrueを返す）
+    fn delete_selection(&mut self) -> bool {
+        let sel = match self.selection {
+            Some(s) => s,
+            None => return false,
+        };
+
+        let ((start_line, start_col), (end_line, end_col)) = sel.normalized();
+
+        // 開始位置のchar_idx
+        let start_idx = if start_line >= self.buffer.len_lines() {
+            self.buffer.len_chars()
+        } else {
+            let line_start = self.buffer.line_to_char(start_line);
+            let line_len = self.buffer.line(start_line).len_chars();
+            line_start + start_col.min(line_len.saturating_sub(1).max(start_col.min(line_len)))
+        };
+
+        // 終了位置のchar_idx
+        let end_idx = if end_line >= self.buffer.len_lines() {
+            self.buffer.len_chars()
+        } else {
+            let line_start = self.buffer.line_to_char(end_line);
+            let line_len = self.buffer.line(end_line).len_chars();
+            line_start + end_col.min(line_len)
+        };
+
+        if start_idx < end_idx && end_idx <= self.buffer.len_chars() {
+            self.add_to_tabs();
+            self.buffer.remove(start_idx..end_idx);
+            self.buffer_dirty = true;
+
+            // カーソルを開始位置に移動
+            self.cursor_line = start_line;
+            self.cursor_col = start_col;
+            self.follow_cursor = true;
+        }
+
+        self.clear_selection();
+        true
     }
 
     /// 選択範囲のテキストを取得
@@ -2331,20 +2389,45 @@ fn main() -> io::Result<()> {
                                     true
                                 }
                             }
-                            KeyCode::Char('a') => { app.move_to_line_start(); false }
-                            KeyCode::Char('e') => { app.move_to_line_end(); false }
-                            KeyCode::Char('f') => {
-                                // 検索モード開始
-                                app.search_mode = true;
-                                app.search_query.clear();
-                                app.search_matches.clear();
+                            KeyCode::Char('a') | KeyCode::Char('A') => {
+                                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                    // Ctrl+Shift+A: 全選択
+                                    app.select_all();
+                                } else {
+                                    // Ctrl+A: 行頭に移動 (emacs beginning-of-line)
+                                    app.move_to_line_start();
+                                }
                                 false
                             }
-                            KeyCode::Char('b') => { app.move_left(); false }
-                            KeyCode::Char('p') => { app.move_up(); false }
-                            KeyCode::Char('n') => { app.move_down(); false }
-                            KeyCode::Char('d') => { app.delete_char_delete(); false }
-                            KeyCode::Char('h') => { app.delete_char_backspace(); false }
+                            KeyCode::Char('e') => { app.move_to_line_end(); false }
+                            KeyCode::Char('f') | KeyCode::Char('F') => {
+                                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                    // Ctrl+Shift+F: 検索モード開始
+                                    app.search_mode = true;
+                                    app.search_query.clear();
+                                    app.search_matches.clear();
+                                } else {
+                                    // Ctrl+F: カーソルを右に移動 (emacs forward-char)
+                                    app.clear_selection();
+                                    app.move_right();
+                                }
+                                false
+                            }
+                            KeyCode::Char('b') => { app.clear_selection(); app.move_left(); false }
+                            KeyCode::Char('p') => { app.clear_selection(); app.move_up(); false }
+                            KeyCode::Char('n') => { app.clear_selection(); app.move_down(); false }
+                            KeyCode::Char('d') => {
+                                if !app.delete_selection() {
+                                    app.delete_char_delete();
+                                }
+                                false
+                            }
+                            KeyCode::Char('h') => {
+                                if !app.delete_selection() {
+                                    app.delete_char_backspace();
+                                }
+                                false
+                            }
                             KeyCode::Char('k') => { app.kill_line(); false }
                             KeyCode::Char('w') => { app.close_current_tab(); false }  // タブを閉じる
                             KeyCode::Char(']') => { app.next_tab(); false }  // 次のタブ
@@ -2376,10 +2459,18 @@ fn main() -> io::Result<()> {
                             KeyCode::Down => { app.clear_selection(); app.move_down(); }
                             KeyCode::Left => { app.clear_selection(); app.move_left(); }
                             KeyCode::Right => { app.clear_selection(); app.move_right(); }
-                            KeyCode::Backspace => { app.clear_selection(); app.delete_char_backspace(); }
-                            KeyCode::Delete => { app.clear_selection(); app.delete_char_delete(); }
-                            KeyCode::Enter => { app.clear_selection(); app.insert_char('\n'); }
-                            KeyCode::Char(c) => { app.clear_selection(); app.insert_char(c); }
+                            KeyCode::Backspace => {
+                                if !app.delete_selection() {
+                                    app.delete_char_backspace();
+                                }
+                            }
+                            KeyCode::Delete => {
+                                if !app.delete_selection() {
+                                    app.delete_char_delete();
+                                }
+                            }
+                            KeyCode::Enter => { app.delete_selection(); app.insert_char('\n'); }
+                            KeyCode::Char(c) => { app.delete_selection(); app.insert_char(c); }
                             _ => {}
                         }
                         false
