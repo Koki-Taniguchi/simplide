@@ -638,11 +638,31 @@ struct App {
     search_query: String,
     search_matches: Vec<(usize, usize)>,  // (line, col)
     search_index: usize,
+    // サイドバー ファイル名フィルタ
+    sidebar_filter_mode: bool,
+    sidebar_filter_query: String,
+    filtered_entries: Vec<PathBuf>,
+    // フォルダ内grep検索
+    grep_mode: bool,
+    grep_query: String,
+    grep_results: Vec<GrepResult>,
+    grep_selected: usize,
+    grep_scroll: usize,
+    // サイドバーボタン位置
+    sidebar_filter_btn: Option<Rect>,
+    sidebar_grep_btn: Option<Rect>,
     // テキスト選択
     selection: Option<Selection>,
     is_selecting: bool,
     // コピーボタン表示位置（画面座標）
     copy_button_area: Option<Rect>,
+}
+
+#[derive(Clone)]
+struct GrepResult {
+    path: PathBuf,
+    line_number: usize,
+    line_content: String,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -757,6 +777,16 @@ impl App {
             search_query: String::new(),
             search_matches: Vec::new(),
             search_index: 0,
+            sidebar_filter_mode: false,
+            sidebar_filter_query: String::new(),
+            filtered_entries: Vec::new(),
+            grep_mode: false,
+            grep_query: String::new(),
+            grep_results: Vec::new(),
+            grep_selected: 0,
+            grep_scroll: 0,
+            sidebar_filter_btn: None,
+            sidebar_grep_btn: None,
             selection: None,
             is_selecting: false,
             copy_button_area: None,
@@ -784,7 +814,13 @@ impl App {
         let mut entries: Vec<PathBuf> = fs::read_dir(path)
             .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
             .unwrap_or_default();
-        entries.sort();
+        entries.sort_by(|a, b| {
+            let a_hidden = a.file_name().map(|n| n.to_string_lossy().starts_with('.')).unwrap_or(false);
+            let b_hidden = b.file_name().map(|n| n.to_string_lossy().starts_with('.')).unwrap_or(false);
+            a_hidden.cmp(&b_hidden)
+                .then_with(|| b.is_dir().cmp(&a.is_dir()))
+                .then_with(|| a.cmp(b))
+        });
         entries
     }
 
@@ -1088,6 +1124,84 @@ impl App {
         }
     }
 
+    fn update_sidebar_filter(&mut self) {
+        if self.sidebar_filter_query.is_empty() {
+            self.filtered_entries = self.entries.clone();
+        } else {
+            let query = self.sidebar_filter_query.to_lowercase();
+            let mut results = Vec::new();
+            Self::collect_files_recursive(&self.root_dir, &query, &mut results, 500);
+            self.filtered_entries = results;
+        }
+        self.sidebar_scroll = 0;
+    }
+
+    fn collect_files_recursive(dir: &PathBuf, query: &str, results: &mut Vec<PathBuf>, max: usize) {
+        if results.len() >= max { return; }
+        let Ok(rd) = fs::read_dir(dir) else { return; };
+        let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        entries.sort();
+        for entry in entries {
+            if results.len() >= max { return; }
+            let name = entry.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if name == ".git" || name == "node_modules" || name == "target" {
+                continue;
+            }
+            if name.to_lowercase().contains(query) {
+                results.push(entry.clone());
+            }
+            if entry.is_dir() {
+                Self::collect_files_recursive(&entry, query, results, max);
+            }
+        }
+    }
+
+    fn grep_search(&mut self) {
+        self.grep_results.clear();
+        self.grep_selected = 0;
+        self.grep_scroll = 0;
+        if self.grep_query.is_empty() {
+            return;
+        }
+        let query = self.grep_query.to_lowercase();
+        let root = self.root_dir.clone();
+        Self::grep_recursive(&root, &query, &mut self.grep_results, 500);
+    }
+
+    fn grep_recursive(dir: &PathBuf, query: &str, results: &mut Vec<GrepResult>, max: usize) {
+        if results.len() >= max { return; }
+        let Ok(rd) = fs::read_dir(dir) else { return; };
+        let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+        entries.sort();
+        for entry in entries {
+            if results.len() >= max { return; }
+            let name = entry.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            if name.starts_with('.') || name == "node_modules" || name == "target" {
+                continue;
+            }
+            if entry.is_dir() {
+                Self::grep_recursive(&entry, query, results, max);
+            } else if entry.is_file() {
+                if let Ok(meta) = fs::metadata(&entry) {
+                    if meta.len() > 1_048_576 { continue; }
+                }
+                if is_image_file(&entry) { continue; }
+                if let Ok(content) = fs::read_to_string(&entry) {
+                    for (i, line) in content.lines().enumerate() {
+                        if results.len() >= max { break; }
+                        if line.to_lowercase().contains(query) {
+                            results.push(GrepResult {
+                                path: entry.clone(),
+                                line_number: i + 1,
+                                line_content: line.trim().to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn file_name(&self) -> String {
         self.file_path
             .as_ref()
@@ -1329,6 +1443,9 @@ impl App {
             && y > self.sidebar_area.y
             && y < self.sidebar_area.y + self.sidebar_area.height.saturating_sub(1)
         {
+            // サイドバークリック時にフィルタモード解除
+            self.sidebar_filter_mode = false;
+
             // サイドバークリック時にディレクトリ内容を更新（外部変更の反映）
             self.refresh_directory();
 
@@ -1345,8 +1462,13 @@ impl App {
                 }
             } else {
                 let entry_index = if show_parent { index - 1 } else { index };
-                if entry_index < self.entries.len() {
-                    let path = self.entries[entry_index].clone();
+                let active_entries = if self.sidebar_filter_mode {
+                    &self.filtered_entries
+                } else {
+                    &self.entries
+                };
+                if entry_index < active_entries.len() {
+                    let path = active_entries[entry_index].clone();
                     if path.is_dir() {
                         self.current_dir = path;
                         self.entries = Self::read_dir(&self.current_dir);
@@ -1401,7 +1523,7 @@ impl App {
                 .map(|e| {
                     let name = e.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     let display = if e.is_dir() {
-                        format!("{}/", name)
+                        format!("▸ {}/", name)
                     } else {
                         name
                     };
@@ -2065,20 +2187,44 @@ fn main() -> io::Result<()> {
             }
 
             // サイドバー（スクロール対応）
-            let entry_names: Vec<String> = app.entries.iter().map(|path| {
-                let name = path.file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                if path.is_dir() {
-                    format!("{}/", name)
+            let display_entries = if app.sidebar_filter_mode {
+                &app.filtered_entries
+            } else {
+                &app.entries
+            };
+            let entry_lines: Vec<(String, Style)> = display_entries.iter().map(|path| {
+                let dim_style = Style::default().fg(Color::Rgb(110, 110, 110));
+                if app.sidebar_filter_mode && !app.sidebar_filter_query.is_empty() {
+                    // フィルタモード: 相対パス表示
+                    let rel = path.strip_prefix(&app.root_dir)
+                        .unwrap_or(path).to_string_lossy().to_string();
+                    let is_hidden = rel.starts_with('.');
+                    let display = if path.is_dir() {
+                        format!("▸ {}/", rel)
+                    } else {
+                        rel
+                    };
+                    let style = if is_hidden { dim_style } else { Style::default() };
+                    (display, style)
                 } else {
-                    name
+                    let name = path.file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let is_hidden = name.starts_with('.');
+                    if path.is_dir() {
+                        let display = format!("▸ {}/", name);
+                        let style = if is_hidden { dim_style } else { Style::default() };
+                        (display, style)
+                    } else {
+                        let style = if is_hidden { dim_style } else { Style::default() };
+                        (name, style)
+                    }
                 }
             }).collect();
 
             let visible_height = chunks[0].height.saturating_sub(2) as usize;
             let show_parent = app.current_dir != app.root_dir;
-            let total_items = entry_names.len() + if show_parent { 1 } else { 0 };
+            let total_items = entry_lines.len() + if show_parent { 1 } else { 0 };
 
             // 横スクロールを適用するヘルパー
             let apply_h_scroll = |s: &str, scroll_x: usize| -> String {
@@ -2096,13 +2242,15 @@ fn main() -> io::Result<()> {
                     if show_parent {
                         if idx == 0 {
                             Some(ListItem::new(Line::from(apply_h_scroll("..", app.sidebar_scroll_x))))
-                        } else if idx - 1 < entry_names.len() {
-                            Some(ListItem::new(Line::from(apply_h_scroll(&entry_names[idx - 1], app.sidebar_scroll_x))))
+                        } else if idx - 1 < entry_lines.len() {
+                            let (ref text, style) = entry_lines[idx - 1];
+                            Some(ListItem::new(Line::from(Span::styled(apply_h_scroll(text, app.sidebar_scroll_x), style))))
                         } else {
                             None
                         }
-                    } else if idx < entry_names.len() {
-                        Some(ListItem::new(Line::from(apply_h_scroll(&entry_names[idx], app.sidebar_scroll_x))))
+                    } else if idx < entry_lines.len() {
+                        let (ref text, style) = entry_lines[idx];
+                        Some(ListItem::new(Line::from(Span::styled(apply_h_scroll(text, app.sidebar_scroll_x), style))))
                     } else {
                         None
                     }
@@ -2139,6 +2287,51 @@ fn main() -> io::Result<()> {
                     .title(title)
                     .borders(Borders::ALL));
             frame.render_widget(sidebar, chunks[0]);
+
+            // サイドバータイトルバーにボタン描画
+            let btn_y = chunks[0].y;
+            let btn_filter_text = " F ";
+            let btn_grep_text = " G ";
+            let btn_grep_x = chunks[0].x + chunks[0].width.saturating_sub(1 + btn_grep_text.len() as u16);
+            let btn_filter_x = btn_grep_x.saturating_sub(btn_filter_text.len() as u16);
+
+            let filter_btn_area = Rect::new(btn_filter_x, btn_y, btn_filter_text.len() as u16, 1);
+            let grep_btn_area = Rect::new(btn_grep_x, btn_y, btn_grep_text.len() as u16, 1);
+            app.sidebar_filter_btn = Some(filter_btn_area);
+            app.sidebar_grep_btn = Some(grep_btn_area);
+
+            let filter_btn_style = if app.sidebar_filter_mode {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default().bg(Color::DarkGray).fg(Color::Cyan)
+            };
+            let grep_btn_style = if app.grep_mode {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default().bg(Color::DarkGray).fg(Color::Yellow)
+            };
+            frame.render_widget(
+                Paragraph::new(btn_filter_text).style(filter_btn_style),
+                filter_btn_area,
+            );
+            frame.render_widget(
+                Paragraph::new(btn_grep_text).style(grep_btn_style),
+                grep_btn_area,
+            );
+
+            // サイドバーフィルタバー
+            if app.sidebar_filter_mode {
+                let filter_area = Rect::new(
+                    chunks[0].x + 1,
+                    chunks[0].y + chunks[0].height.saturating_sub(2),
+                    chunks[0].width.saturating_sub(2),
+                    1,
+                );
+                let filter_text = format!("Filter: {}", app.sidebar_filter_query);
+                let filter_bar = Paragraph::new(filter_text)
+                    .style(Style::default().bg(Color::Blue).fg(Color::White));
+                frame.render_widget(filter_bar, filter_area);
+            }
 
             // エディタ
             if app.is_image_mode {
@@ -2254,6 +2447,81 @@ fn main() -> io::Result<()> {
                 frame.render_widget(Clear, dialog_area);
                 frame.render_widget(dialog, dialog_area);
             }
+
+            // Grep検索オーバーレイ
+            if app.grep_mode {
+                let area = frame.area();
+                let overlay_width = (area.width * 80 / 100).max(40).min(area.width);
+                let overlay_height = (area.height * 70 / 100).max(10).min(area.height);
+                let overlay_area = Rect::new(
+                    area.x + (area.width.saturating_sub(overlay_width)) / 2,
+                    area.y + (area.height.saturating_sub(overlay_height)) / 2,
+                    overlay_width,
+                    overlay_height,
+                );
+                frame.render_widget(Clear, overlay_area);
+
+                let block = Block::default().title(" Find in Path ").borders(Borders::ALL)
+                    .style(Style::default().bg(Color::DarkGray));
+                let inner_area = block.inner(overlay_area);
+                frame.render_widget(block, overlay_area);
+
+                // 検索バー (上部1行)
+                let search_line = Rect::new(inner_area.x, inner_area.y, inner_area.width, 1);
+                let match_info = if app.grep_results.is_empty() {
+                    if app.grep_query.is_empty() { String::new() }
+                    else { " (no results)".to_string() }
+                } else {
+                    format!(" ({}/{})", app.grep_selected + 1, app.grep_results.len())
+                };
+                let search_text = format!("Search: {}{}", app.grep_query, match_info);
+                frame.render_widget(
+                    Paragraph::new(search_text).style(Style::default().fg(Color::White)),
+                    search_line,
+                );
+
+                // 結果リスト
+                let results_area = Rect::new(
+                    inner_area.x, inner_area.y + 1,
+                    inner_area.width, inner_area.height.saturating_sub(1),
+                );
+                let visible = results_area.height as usize;
+                // スクロール調整
+                if app.grep_selected < app.grep_scroll {
+                    app.grep_scroll = app.grep_selected;
+                } else if app.grep_selected >= app.grep_scroll + visible {
+                    app.grep_scroll = app.grep_selected.saturating_sub(visible - 1);
+                }
+                let items: Vec<ListItem> = app.grep_results.iter().enumerate()
+                    .skip(app.grep_scroll)
+                    .take(visible)
+                    .map(|(i, r)| {
+                        let rel = r.path.strip_prefix(&app.root_dir)
+                            .unwrap_or(&r.path).to_string_lossy();
+                        let text = format!("{}:{}: {}", rel, r.line_number, r.line_content);
+                        let style = if i == app.grep_selected {
+                            Style::default().bg(Color::Blue).fg(Color::White)
+                        } else {
+                            Style::default().fg(Color::White)
+                        };
+                        ListItem::new(Line::from(Span::styled(text, style)))
+                    })
+                    .collect();
+                frame.render_widget(List::new(items), results_area);
+
+                // 検索バーにカーソル表示
+                let cursor_x = (search_line.x + 8 + app.grep_query.len() as u16)
+                    .min(search_line.x + search_line.width.saturating_sub(1));
+                frame.set_cursor_position((cursor_x, search_line.y));
+            }
+
+            // サイドバーフィルタのカーソル表示
+            if app.sidebar_filter_mode {
+                let filter_cursor_x = (chunks[0].x + 1 + 8 + app.sidebar_filter_query.len() as u16)
+                    .min(chunks[0].x + chunks[0].width.saturating_sub(2));
+                let filter_cursor_y = chunks[0].y + chunks[0].height.saturating_sub(2);
+                frame.set_cursor_position((filter_cursor_x, filter_cursor_y));
+            }
         }).is_err() {
             // 描画エラー時は画面クリアを試みて続行
             let _ = terminal.clear();
@@ -2360,6 +2628,121 @@ fn main() -> io::Result<()> {
                                 _ => false,
                             }
                         }
+                    // サイドバーフィルタモード
+                    } else if app.sidebar_filter_mode {
+                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            match key.code {
+                                KeyCode::Char('c') => { app.sidebar_filter_mode = false; false }
+                                KeyCode::Char('h') => {
+                                    app.sidebar_filter_query.pop();
+                                    app.update_sidebar_filter();
+                                    false
+                                }
+                                KeyCode::Char('u') => {
+                                    app.sidebar_filter_query.clear();
+                                    app.update_sidebar_filter();
+                                    false
+                                }
+                                _ => false,
+                            }
+                        } else {
+                            match key.code {
+                                KeyCode::Esc => { app.sidebar_filter_mode = false; false }
+                                KeyCode::Backspace => {
+                                    app.sidebar_filter_query.pop();
+                                    app.update_sidebar_filter();
+                                    false
+                                }
+                                KeyCode::Enter => {
+                                    if !app.filtered_entries.is_empty() {
+                                        let path = app.filtered_entries[0].clone();
+                                        if path.is_dir() {
+                                            app.current_dir = path;
+                                            app.entries = App::read_dir(&app.current_dir);
+                                        } else {
+                                            app.open_file(&path);
+                                        }
+                                    }
+                                    app.sidebar_filter_mode = false;
+                                    false
+                                }
+                                KeyCode::Char(c) => {
+                                    app.sidebar_filter_query.push(c);
+                                    app.update_sidebar_filter();
+                                    false
+                                }
+                                _ => false,
+                            }
+                        }
+                    // Grep検索モード
+                    } else if app.grep_mode {
+                        if key.modifiers.contains(KeyModifiers::CONTROL) {
+                            match key.code {
+                                KeyCode::Char('c') => { app.grep_mode = false; false }
+                                KeyCode::Char('n') | KeyCode::Char('g') => {
+                                    if !app.grep_results.is_empty() {
+                                        app.grep_selected = (app.grep_selected + 1) % app.grep_results.len();
+                                    }
+                                    false
+                                }
+                                KeyCode::Char('p') => {
+                                    if !app.grep_results.is_empty() {
+                                        app.grep_selected = if app.grep_selected == 0 {
+                                            app.grep_results.len() - 1
+                                        } else {
+                                            app.grep_selected - 1
+                                        };
+                                    }
+                                    false
+                                }
+                                KeyCode::Char('h') => {
+                                    app.grep_query.pop();
+                                    app.grep_search();
+                                    false
+                                }
+                                KeyCode::Char('u') => {
+                                    app.grep_query.clear();
+                                    app.grep_search();
+                                    false
+                                }
+                                _ => false,
+                            }
+                        } else {
+                            match key.code {
+                                KeyCode::Esc => { app.grep_mode = false; false }
+                                KeyCode::Backspace => {
+                                    app.grep_query.pop();
+                                    app.grep_search();
+                                    false
+                                }
+                                KeyCode::Up => {
+                                    if app.grep_selected > 0 { app.grep_selected -= 1; }
+                                    false
+                                }
+                                KeyCode::Down => {
+                                    if app.grep_selected + 1 < app.grep_results.len() {
+                                        app.grep_selected += 1;
+                                    }
+                                    false
+                                }
+                                KeyCode::Enter => {
+                                    if let Some(result) = app.grep_results.get(app.grep_selected).cloned() {
+                                        app.open_file(&result.path);
+                                        app.cursor_line = result.line_number.saturating_sub(1);
+                                        app.cursor_col = 0;
+                                        app.follow_cursor = true;
+                                        app.grep_mode = false;
+                                    }
+                                    false
+                                }
+                                KeyCode::Char(c) => {
+                                    app.grep_query.push(c);
+                                    app.grep_search();
+                                    false
+                                }
+                                _ => false,
+                            }
+                        }
                     // Command-S (macOS) または Ctrl-S で保存
                     } else if (key.modifiers.contains(KeyModifiers::SUPER) || key.modifiers.contains(KeyModifiers::CONTROL))
                         && key.code == KeyCode::Char('s')
@@ -2395,6 +2778,7 @@ fn main() -> io::Result<()> {
                                     app.select_all();
                                 } else {
                                     // Ctrl+A: 行頭に移動 (emacs beginning-of-line)
+                                    app.clear_selection();
                                     app.move_to_line_start();
                                 }
                                 false
@@ -2432,6 +2816,24 @@ fn main() -> io::Result<()> {
                             KeyCode::Char('w') => { app.close_current_tab(); false }  // タブを閉じる
                             KeyCode::Char(']') => { app.next_tab(); false }  // 次のタブ
                             KeyCode::Char('[') => { app.prev_tab(); false }  // 前のタブ
+                            KeyCode::Char('t') => {
+                                // Ctrl+T: サイドバーファイル名フィルタ
+                                app.grep_mode = false;
+                                app.sidebar_filter_mode = true;
+                                app.sidebar_filter_query.clear();
+                                app.filtered_entries = app.entries.clone();
+                                false
+                            }
+                            KeyCode::Char('g') => {
+                                // Ctrl+G: フォルダ内grep検索
+                                app.sidebar_filter_mode = false;
+                                app.grep_mode = true;
+                                app.grep_query.clear();
+                                app.grep_results.clear();
+                                app.grep_selected = 0;
+                                app.grep_scroll = 0;
+                                false
+                            }
                             _ => false,
                         }
                     } else if key.modifiers.contains(KeyModifiers::ALT) {
@@ -2498,7 +2900,59 @@ fn main() -> io::Result<()> {
                                 false
                             };
 
-                            if clicked_copy_button {
+                            // サイドバーボタンのクリック判定
+                            let clicked_filter_btn = if let Some(btn) = app.sidebar_filter_btn {
+                                x >= btn.x && x < btn.x + btn.width && y == btn.y
+                            } else { false };
+                            let clicked_grep_btn = if let Some(btn) = app.sidebar_grep_btn {
+                                x >= btn.x && x < btn.x + btn.width && y == btn.y
+                            } else { false };
+
+                            // フィルタ/grepモード中、対象外エリアクリックで自動解除
+                            if app.sidebar_filter_mode && !clicked_filter_btn {
+                                // フィルタバー領域内かチェック
+                                let in_filter_bar = {
+                                    let fx = app.sidebar_area.x + 1;
+                                    let fy = app.sidebar_area.y + app.sidebar_area.height.saturating_sub(2);
+                                    let fw = app.sidebar_area.width.saturating_sub(2);
+                                    x >= fx && x < fx + fw && y == fy
+                                };
+                                // サイドバー内のエントリクリックも許可
+                                let in_sidebar = x >= app.sidebar_area.x
+                                    && x < app.sidebar_area.x + app.sidebar_area.width
+                                    && y > app.sidebar_area.y
+                                    && y < app.sidebar_area.y + app.sidebar_area.height.saturating_sub(1);
+                                if !in_filter_bar && !in_sidebar {
+                                    app.sidebar_filter_mode = false;
+                                }
+                            }
+                            if app.grep_mode && !clicked_grep_btn {
+                                // grepオーバーレイ領域内かチェック
+                                let sz = terminal.size().unwrap_or_default();
+                                let area = Rect::new(0, 0, sz.width, sz.height);
+                                let ow = (area.width * 80 / 100).max(40).min(area.width);
+                                let oh = (area.height * 70 / 100).max(10).min(area.height);
+                                let ox = area.x + (area.width.saturating_sub(ow)) / 2;
+                                let oy = area.y + (area.height.saturating_sub(oh)) / 2;
+                                let in_overlay = x >= ox && x < ox + ow && y >= oy && y < oy + oh;
+                                if !in_overlay {
+                                    app.grep_mode = false;
+                                }
+                            }
+
+                            if clicked_filter_btn {
+                                app.grep_mode = false;
+                                app.sidebar_filter_mode = true;
+                                app.sidebar_filter_query.clear();
+                                app.filtered_entries = app.entries.clone();
+                            } else if clicked_grep_btn {
+                                app.sidebar_filter_mode = false;
+                                app.grep_mode = true;
+                                app.grep_query.clear();
+                                app.grep_results.clear();
+                                app.grep_selected = 0;
+                                app.grep_scroll = 0;
+                            } else if clicked_copy_button {
                                 // コピーボタンクリック：OSC 52でコピーして選択解除
                                 if let Some(text) = app.get_selected_text() {
                                     app.copy_to_clipboard_osc52(&text);
