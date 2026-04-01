@@ -2889,6 +2889,17 @@ fn main() -> io::Result<()> {
                         && x < app.editor_area.x + app.editor_area.width
                         && y >= app.editor_area.y
                         && y < app.editor_area.y + app.editor_area.height;
+                    let in_grep_overlay = if app.grep_mode {
+                        let sz = terminal.size().unwrap_or_default();
+                        let area = Rect::new(0, 0, sz.width, sz.height);
+                        let ow = (area.width * 80 / 100).max(40).min(area.width);
+                        let oh = (area.height * 70 / 100).max(10).min(area.height);
+                        let ox = area.x + (area.width.saturating_sub(ow)) / 2;
+                        let oy = area.y + (area.height.saturating_sub(oh)) / 2;
+                        x >= ox && x < ox + ow && y >= oy && y < oy + oh
+                    } else {
+                        false
+                    };
 
                     match mouse.kind {
                         MouseEventKind::Down(MouseButton::Left) => {
@@ -2992,14 +3003,20 @@ fn main() -> io::Result<()> {
                             app.end_selection();
                         }
                         MouseEventKind::ScrollUp => {
-                            if in_sidebar {
+                            if in_grep_overlay {
+                                if app.grep_selected > 0 { app.grep_selected -= 1; }
+                            } else if in_sidebar {
                                 app.handle_sidebar_scroll(x, y, -1);
                             } else if in_editor {
                                 app.handle_editor_scroll(-1);
                             }
                         }
                         MouseEventKind::ScrollDown => {
-                            if in_sidebar {
+                            if in_grep_overlay {
+                                if app.grep_selected + 1 < app.grep_results.len() {
+                                    app.grep_selected += 1;
+                                }
+                            } else if in_sidebar {
                                 app.handle_sidebar_scroll(x, y, 1);
                             } else if in_editor {
                                 app.handle_editor_scroll(1);
