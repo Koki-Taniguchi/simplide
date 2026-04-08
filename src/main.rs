@@ -642,6 +642,7 @@ struct App {
     sidebar_filter_mode: bool,
     sidebar_filter_query: String,
     filtered_entries: Vec<PathBuf>,
+    sidebar_filter_selected: usize,
     // フォルダ内grep検索
     grep_mode: bool,
     grep_query: String,
@@ -663,6 +664,7 @@ struct GrepResult {
     path: PathBuf,
     line_number: usize,
     line_content: String,
+    match_col: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -780,6 +782,7 @@ impl App {
             sidebar_filter_mode: false,
             sidebar_filter_query: String::new(),
             filtered_entries: Vec::new(),
+            sidebar_filter_selected: 0,
             grep_mode: false,
             grep_query: String::new(),
             grep_results: Vec::new(),
@@ -1134,6 +1137,7 @@ impl App {
             self.filtered_entries = results;
         }
         self.sidebar_scroll = 0;
+        self.sidebar_filter_selected = 0;
     }
 
     fn collect_files_recursive(dir: &PathBuf, query: &str, results: &mut Vec<PathBuf>, max: usize) {
@@ -1189,11 +1193,15 @@ impl App {
                 if let Ok(content) = fs::read_to_string(&entry) {
                     for (i, line) in content.lines().enumerate() {
                         if results.len() >= max { break; }
-                        if line.to_lowercase().contains(query) {
+                        let lower = line.to_lowercase();
+                        if let Some(pos) = lower.find(query) {
+                            // byte位置からchar位置に変換
+                            let match_col = line[..pos].chars().count();
                             results.push(GrepResult {
                                 path: entry.clone(),
                                 line_number: i + 1,
                                 line_content: line.trim().to_string(),
+                                match_col,
                             });
                         }
                     }
@@ -1410,6 +1418,14 @@ impl App {
         }
     }
 
+    /// カーソル行が画面中央に来るようスクロール位置を設定
+    fn center_cursor(&mut self) {
+        let visible_height = self.editor_area.height.saturating_sub(2) as usize;
+        if visible_height > 0 {
+            self.scroll_offset = self.cursor_line.saturating_sub(visible_height / 2);
+        }
+    }
+
     fn handle_editor_scroll(&mut self, delta: i16) {
         self.follow_cursor = false; // マウススクロール中はカーソル追従を無効化
         let total_lines = self.buffer.len_lines();
@@ -1443,15 +1459,19 @@ impl App {
             && y > self.sidebar_area.y
             && y < self.sidebar_area.y + self.sidebar_area.height.saturating_sub(1)
         {
+            let was_filter_mode = self.sidebar_filter_mode;
+
             // サイドバークリック時にフィルタモード解除
             self.sidebar_filter_mode = false;
 
-            // サイドバークリック時にディレクトリ内容を更新（外部変更の反映）
-            self.refresh_directory();
+            // フィルタモード中はrefreshしない（filtered_entriesを使うため）
+            if !was_filter_mode {
+                self.refresh_directory();
+            }
 
             let visible_index = (y - self.sidebar_area.y - 1) as usize;
             let index = visible_index + self.sidebar_scroll;
-            let show_parent = self.current_dir != self.root_dir;
+            let show_parent = !was_filter_mode && self.current_dir != self.root_dir;
 
             if show_parent && index == 0 {
                 if let Some(parent) = self.current_dir.parent() {
@@ -1462,7 +1482,7 @@ impl App {
                 }
             } else {
                 let entry_index = if show_parent { index - 1 } else { index };
-                let active_entries = if self.sidebar_filter_mode {
+                let active_entries = if was_filter_mode {
                     &self.filtered_entries
                 } else {
                     &self.entries
@@ -1475,6 +1495,16 @@ impl App {
                         self.sidebar_scroll = 0;
                         self.sidebar_scroll_x = 0;
                     } else {
+                        if was_filter_mode {
+                            if let Some(parent) = path.parent() {
+                                if parent != self.current_dir {
+                                    self.current_dir = parent.to_path_buf();
+                                    self.entries = Self::read_dir(&self.current_dir);
+                                    self.sidebar_scroll = 0;
+                                    self.sidebar_scroll_x = 0;
+                                }
+                            }
+                        }
                         self.open_file(&path);
                     }
                 }
@@ -2236,6 +2266,15 @@ fn main() -> io::Result<()> {
                 }
             };
 
+            // フィルタモード中の選択スクロール追従
+            if app.sidebar_filter_mode && !app.filtered_entries.is_empty() {
+                if app.sidebar_filter_selected < app.sidebar_scroll {
+                    app.sidebar_scroll = app.sidebar_filter_selected;
+                } else if app.sidebar_filter_selected >= app.sidebar_scroll + visible_height {
+                    app.sidebar_scroll = app.sidebar_filter_selected.saturating_sub(visible_height - 1);
+                }
+            }
+
             let items: Vec<ListItem> = (0..visible_height)
                 .filter_map(|i| {
                     let idx = app.sidebar_scroll + i;
@@ -2243,13 +2282,24 @@ fn main() -> io::Result<()> {
                         if idx == 0 {
                             Some(ListItem::new(Line::from(apply_h_scroll("..", app.sidebar_scroll_x))))
                         } else if idx - 1 < entry_lines.len() {
-                            let (ref text, style) = entry_lines[idx - 1];
+                            let entry_idx = idx - 1;
+                            let (ref text, style) = entry_lines[entry_idx];
+                            let style = if app.sidebar_filter_mode && entry_idx == app.sidebar_filter_selected {
+                                Style::default().bg(Color::Blue).fg(Color::White)
+                            } else {
+                                style
+                            };
                             Some(ListItem::new(Line::from(Span::styled(apply_h_scroll(text, app.sidebar_scroll_x), style))))
                         } else {
                             None
                         }
                     } else if idx < entry_lines.len() {
                         let (ref text, style) = entry_lines[idx];
+                        let style = if app.sidebar_filter_mode && idx == app.sidebar_filter_selected {
+                            Style::default().bg(Color::Blue).fg(Color::White)
+                        } else {
+                            style
+                        };
                         Some(ListItem::new(Line::from(Span::styled(apply_h_scroll(text, app.sidebar_scroll_x), style))))
                     } else {
                         None
@@ -2643,6 +2693,22 @@ fn main() -> io::Result<()> {
                                     app.update_sidebar_filter();
                                     false
                                 }
+                                KeyCode::Char('n') | KeyCode::Char('g') => {
+                                    if !app.filtered_entries.is_empty() {
+                                        app.sidebar_filter_selected = (app.sidebar_filter_selected + 1) % app.filtered_entries.len();
+                                    }
+                                    false
+                                }
+                                KeyCode::Char('p') => {
+                                    if !app.filtered_entries.is_empty() {
+                                        app.sidebar_filter_selected = if app.sidebar_filter_selected == 0 {
+                                            app.filtered_entries.len() - 1
+                                        } else {
+                                            app.sidebar_filter_selected - 1
+                                        };
+                                    }
+                                    false
+                                }
                                 _ => false,
                             }
                         } else {
@@ -2653,13 +2719,30 @@ fn main() -> io::Result<()> {
                                     app.update_sidebar_filter();
                                     false
                                 }
+                                KeyCode::Up => {
+                                    if app.sidebar_filter_selected > 0 { app.sidebar_filter_selected -= 1; }
+                                    false
+                                }
+                                KeyCode::Down => {
+                                    if app.sidebar_filter_selected + 1 < app.filtered_entries.len() {
+                                        app.sidebar_filter_selected += 1;
+                                    }
+                                    false
+                                }
                                 KeyCode::Enter => {
-                                    if !app.filtered_entries.is_empty() {
-                                        let path = app.filtered_entries[0].clone();
+                                    if let Some(path) = app.filtered_entries.get(app.sidebar_filter_selected).cloned() {
                                         if path.is_dir() {
                                             app.current_dir = path;
                                             app.entries = App::read_dir(&app.current_dir);
                                         } else {
+                                            if let Some(parent) = path.parent() {
+                                                if parent != app.current_dir {
+                                                    app.current_dir = parent.to_path_buf();
+                                                    app.entries = App::read_dir(&app.current_dir);
+                                                    app.sidebar_scroll = 0;
+                                                    app.sidebar_scroll_x = 0;
+                                                }
+                                            }
                                             app.open_file(&path);
                                         }
                                     }
@@ -2729,7 +2812,8 @@ fn main() -> io::Result<()> {
                                     if let Some(result) = app.grep_results.get(app.grep_selected).cloned() {
                                         app.open_file(&result.path);
                                         app.cursor_line = result.line_number.saturating_sub(1);
-                                        app.cursor_col = 0;
+                                        app.cursor_col = result.match_col;
+                                        app.center_cursor();
                                         app.follow_cursor = true;
                                         app.grep_mode = false;
                                     }
@@ -2822,6 +2906,7 @@ fn main() -> io::Result<()> {
                                 app.sidebar_filter_mode = true;
                                 app.sidebar_filter_query.clear();
                                 app.filtered_entries = app.entries.clone();
+                                app.sidebar_filter_selected = 0;
                                 false
                             }
                             KeyCode::Char('g') => {
@@ -2948,6 +3033,25 @@ fn main() -> io::Result<()> {
                                 let in_overlay = x >= ox && x < ox + ow && y >= oy && y < oy + oh;
                                 if !in_overlay {
                                     app.grep_mode = false;
+                                } else {
+                                    // オーバーレイ内クリック: 結果リスト領域かチェック
+                                    // inner_area: border(1) + search_bar(1) = oy+2 から結果リスト開始
+                                    let results_start_y = oy + 2;
+                                    let results_end_y = oy + oh - 1; // border分
+                                    if y >= results_start_y && y < results_end_y {
+                                        let clicked_idx = app.grep_scroll + (y - results_start_y) as usize;
+                                        if clicked_idx < app.grep_results.len() {
+                                            app.grep_selected = clicked_idx;
+                                            // シングルクリックで遷移
+                                            let result = app.grep_results[clicked_idx].clone();
+                                            app.open_file(&result.path);
+                                            app.cursor_line = result.line_number.saturating_sub(1);
+                                            app.cursor_col = result.match_col;
+                                            app.center_cursor();
+                                            app.follow_cursor = true;
+                                            app.grep_mode = false;
+                                        }
+                                    }
                                 }
                             }
 
@@ -2956,6 +3060,7 @@ fn main() -> io::Result<()> {
                                 app.sidebar_filter_mode = true;
                                 app.sidebar_filter_query.clear();
                                 app.filtered_entries = app.entries.clone();
+                                app.sidebar_filter_selected = 0;
                             } else if clicked_grep_btn {
                                 app.sidebar_filter_mode = false;
                                 app.grep_mode = true;
@@ -2969,7 +3074,7 @@ fn main() -> io::Result<()> {
                                     app.copy_to_clipboard_osc52(&text);
                                 }
                                 app.clear_selection();
-                            } else {
+                            } else if !in_grep_overlay {
                                 app.handle_tab_click(x, y);
                                 app.handle_sidebar_click(x, y);
                                 // エディタ領域でのクリックは選択開始
