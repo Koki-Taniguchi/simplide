@@ -35,3 +35,7 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 
 # Unicode
 unicode-width = "0.2"
+
+# WebSocket (Claude Code IDE連携)
+tungstenite = "0.26"
+uuid = { version = "1", features = ["v4"] }

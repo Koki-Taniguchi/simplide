@@ -2,11 +2,13 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io;
+use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::panic;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use crossterm::{
     event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
@@ -124,6 +126,208 @@ impl Config {
 fn reset_terminal() {
     let _ = disable_raw_mode();
     let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste);
+}
+
+// === Claude Code MCP連携 ===
+
+/// エディタの共有状態（MCPスレッドからアクセス）
+#[derive(Clone)]
+struct EditorSharedState {
+    file_path: String,
+    cursor_line: usize,
+    cursor_col: usize,
+    selected_text: String,
+    visible_start: usize,
+    visible_end: usize,
+    total_lines: usize,
+    buffer_content: String,
+    open_tabs: Vec<String>,
+}
+
+impl Default for EditorSharedState {
+    fn default() -> Self {
+        Self {
+            file_path: String::new(),
+            cursor_line: 0,
+            cursor_col: 0,
+            selected_text: String::new(),
+            visible_start: 0,
+            visible_end: 0,
+            total_lines: 0,
+            buffer_content: String::new(),
+            open_tabs: Vec::new(),
+        }
+    }
+}
+
+fn handle_mcp_request(request: &str, state: &Arc<Mutex<EditorSharedState>>) -> Option<String> {
+    // 最小限のJSON-RPCパーサー
+    let id = extract_json_field(request, "id");
+    let method = extract_json_string(request, "method")?;
+
+    match method.as_str() {
+        "initialize" => {
+            Some(format!(
+                r#"{{"jsonrpc":"2.0","id":{},"result":{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{"listChanged":false}}}},"serverInfo":{{"name":"simplide","version":"0.1.0"}}}}}}"#,
+                id.unwrap_or("null".to_string())
+            ))
+        }
+        "notifications/initialized" => None,
+        "tools/list" => {
+            let tools = r#"[{"name":"getDiagnostics","description":"Returns editor state from simplide: open file, cursor position, selected text, visible code range, and open tabs. Optionally scoped to a file path.","inputSchema":{"type":"object","properties":{"uri":{"type":"string","description":"Optional file path to scope diagnostics to"}}}}]"#;
+            Some(format!(
+                r#"{{"jsonrpc":"2.0","id":{},"result":{{"tools":{}}}}}"#,
+                id.unwrap_or("null".to_string()),
+                tools
+            ))
+        }
+        "tools/call" => {
+            let tool_name = extract_json_string(request, "name").unwrap_or_default();
+            let st = state.lock().unwrap().clone();
+            let result_text = match tool_name.as_str() {
+                "getDiagnostics" => {
+                    let tabs_json: Vec<String> = st.open_tabs.iter()
+                        .map(|t| format!(r#""{}""#, escape_json(t))).collect();
+                    let visible_code = if !st.file_path.is_empty() {
+                        let lines: Vec<&str> = st.buffer_content.lines().collect();
+                        let start = st.visible_start.saturating_sub(1);
+                        let end = st.visible_end.min(lines.len());
+                        let visible: Vec<String> = lines[start..end].iter().enumerate()
+                            .map(|(i, l)| format!("{}: {}", start + i + 1, l))
+                            .collect();
+                        visible.join("\\n")
+                    } else {
+                        String::new()
+                    };
+                    format!(
+                        r#"{{"editor":"simplide","file":"{}","cursor":{{"line":{},"col":{}}},"selected_text":"{}","visible_range":{{"start":{},"end":{}}},"visible_code":"{}","total_lines":{},"open_tabs":[{}]}}"#,
+                        escape_json(&st.file_path), st.cursor_line, st.cursor_col,
+                        escape_json(&st.selected_text),
+                        st.visible_start, st.visible_end,
+                        escape_json(&visible_code),
+                        st.total_lines,
+                        tabs_json.join(",")
+                    )
+                }
+                _ => format!("Unknown tool: {}", tool_name),
+            };
+            Some(format!(
+                r#"{{"jsonrpc":"2.0","id":{},"result":{{"content":[{{"type":"text","text":"{}"}}]}}}}"#,
+                id.unwrap_or("null".to_string()),
+                escape_json(&result_text)
+            ))
+        }
+        _ => {
+            Some(format!(
+                r#"{{"jsonrpc":"2.0","id":{},"error":{{"code":-32601,"message":"Method not found"}}}}"#,
+                id.unwrap_or("null".to_string())
+            ))
+        }
+    }
+}
+
+fn escape_json(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "").replace('\t', "\\t")
+}
+
+fn extract_json_string(json: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{}\"", key);
+    let pos = json.find(&pattern)?;
+    let after = &json[pos + pattern.len()..];
+    let colon = after.find(':')?;
+    let after_colon = after[colon + 1..].trim_start();
+    if after_colon.starts_with('"') {
+        let content = &after_colon[1..];
+        let end = content.find('"')?;
+        Some(content[..end].to_string())
+    } else {
+        None
+    }
+}
+
+fn extract_json_field(json: &str, key: &str) -> Option<String> {
+    let pattern = format!("\"{}\"", key);
+    let pos = json.find(&pattern)?;
+    let after = &json[pos + pattern.len()..];
+    let colon = after.find(':')?;
+    let after_colon = after[colon + 1..].trim_start();
+    // 数値、文字列、null等を取得
+    let end = after_colon.find(|c: char| c == ',' || c == '}' || c == ']')?;
+    let value = after_colon[..end].trim();
+    Some(value.to_string())
+}
+
+/// WebSocket MCPサーバーをバックグラウンド起動し、~/.claude/ide/ にロックファイルを書く
+fn start_ide_mcp_server(state: Arc<Mutex<EditorSharedState>>, workspace: &str) -> Option<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+    let port = listener.local_addr().ok()?.port();
+    let auth_token = uuid::Uuid::new_v4().to_string();
+
+    // ~/.claude/ide/ にロックファイルを作成
+    let ide_dir = dirs::home_dir()?.join(".claude").join("ide");
+    let _ = fs::create_dir_all(&ide_dir);
+    // ディレクトリのパーミッションを0700に
+    let _ = fs::set_permissions(&ide_dir, fs::Permissions::from_mode(0o700));
+
+    let lock_path = ide_dir.join(format!("{}.lock", port));
+    let lock_content = format!(
+        r#"{{"pid":{},"workspaceFolders":["{}"],"ideName":"simplide","transport":"ws","runningInWindows":false,"authToken":"{}"}}"#,
+        std::process::id(),
+        escape_json(workspace),
+        auth_token
+    );
+    let _ = fs::write(&lock_path, &lock_content);
+    let _ = fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600));
+
+    let expected_token = auth_token.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            if let Ok(stream) = stream {
+                let st = state.clone();
+                let token = expected_token.clone();
+                std::thread::spawn(move || {
+                    handle_ws_connection(stream, &st, &token);
+                });
+            }
+        }
+    });
+
+    Some(port)
+}
+
+fn handle_ws_connection(stream: std::net::TcpStream, state: &Arc<Mutex<EditorSharedState>>, _auth_token: &str) {
+    let mut ws = match tungstenite::accept(stream) {
+        Ok(ws) => ws,
+        Err(_) => return,
+    };
+
+    loop {
+        let msg = match ws.read() {
+            Ok(msg) => msg,
+            Err(_) => break,
+        };
+
+        match msg {
+            tungstenite::Message::Text(text) => {
+                if let Some(response) = handle_mcp_request(&text, state) {
+                    if ws.send(tungstenite::Message::Text(response.into())).is_err() {
+                        break;
+                    }
+                    let _ = ws.flush();
+                }
+            }
+            tungstenite::Message::Close(_) => break,
+            _ => {}
+        }
+    }
+}
+
+/// 終了時にロックファイルを削除
+fn cleanup_ide_lock(port: u16) {
+    if let Some(home) = dirs::home_dir() {
+        let lock_path = home.join(".claude").join("ide").join(format!("{}.lock", port));
+        let _ = fs::remove_file(&lock_path);
+    }
 }
 
 // ハイライト名とカラーのマッピング
@@ -664,6 +868,10 @@ struct App {
     is_selecting: bool,
     // コピーボタン表示位置（画面座標）
     copy_button_area: Option<Rect>,
+    // Claude Code MCP連携
+    last_state_write: Instant,
+    shared_state: Arc<Mutex<EditorSharedState>>,
+    mcp_port: Option<u16>,
 }
 
 #[derive(Clone)]
@@ -818,7 +1026,14 @@ impl App {
             selection: None,
             is_selecting: false,
             copy_button_area: None,
+            last_state_write: Instant::now(),
+            shared_state: Arc::new(Mutex::new(EditorSharedState::default())),
+            mcp_port: None,
         };
+
+        // IDE MCPサーバー起動 (WebSocket + ~/.claude/ide/ ロックファイル)
+        let workspace_str = app.root_dir.to_string_lossy().to_string();
+        app.mcp_port = start_ide_mcp_server(app.shared_state.clone(), &workspace_str);
 
         // 初期ファイルがあれば開く
         if let Some(file_path) = initial_file {
@@ -1423,6 +1638,37 @@ impl App {
         }
     }
 
+    /// 共有状態を更新（MCPサーバーが参照する）
+    fn update_shared_state(&mut self) {
+        if self.last_state_write.elapsed().as_millis() < 500 {
+            return;
+        }
+        self.last_state_write = Instant::now();
+
+        let visible_height = self.editor_area.height.saturating_sub(2) as usize;
+        let visible_start = self.scroll_offset;
+        let visible_end = (self.scroll_offset + visible_height).min(self.buffer.len_lines());
+
+        let new_state = EditorSharedState {
+            file_path: self.file_path.as_ref()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            cursor_line: self.cursor_line + 1,
+            cursor_col: self.cursor_col + 1,
+            selected_text: self.get_selected_text().unwrap_or_default(),
+            visible_start: visible_start + 1,
+            visible_end,
+            total_lines: self.buffer.len_lines(),
+            buffer_content: self.buffer.to_string(),
+            open_tabs: self.tabs.iter().map(|p| p.to_string_lossy().to_string()).collect(),
+        };
+
+        if let Ok(mut st) = self.shared_state.lock() {
+            *st = new_state;
+        }
+    }
+
+    /// 終了時に .mcp.json を削除
     fn update_scroll(&mut self) {
         if !self.follow_cursor {
             return;
@@ -2168,6 +2414,7 @@ fn main() -> io::Result<()> {
         }
 
         app.update_scroll();
+        app.update_shared_state();
 
         // 画面クリアが必要な場合
         if app.needs_clear {
@@ -3256,6 +3503,9 @@ fn main() -> io::Result<()> {
             };
 
             if should_break {
+                if let Some(port) = app.mcp_port {
+                    cleanup_ide_lock(port);
+                }
                 disable_raw_mode()?;
                 execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture, DisableBracketedPaste)?;
                 return Ok(());
