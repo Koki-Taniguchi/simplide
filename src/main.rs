@@ -330,6 +330,78 @@ fn cleanup_ide_lock(port: u16) {
     }
 }
 
+/// ~/.claude/settings.json にUserPromptSubmitフックを自動登録（既に存在すれば何もしない）
+fn ensure_claude_hook() {
+    let Some(home) = dirs::home_dir() else { return; };
+    let settings_path = home.join(".claude").join("settings.json");
+
+    let content = fs::read_to_string(&settings_path).unwrap_or_default();
+
+    // 既にsimplideのhookが登録済みなら何もしない
+    if content.contains("simplide") && content.contains("UserPromptSubmit") {
+        return;
+    }
+
+    let hook_cmd = r#"grep -ql simplide ~/.claude/ide/*.lock 2>/dev/null && echo '[simplide] side editor is active. Call getDiagnostics to check current editor state before responding.' || true"#;
+    let hook_entry = format!(r#""UserPromptSubmit":[{{"hooks":[{{"type":"command","command":"{}"}}]}}]"#, hook_cmd);
+
+    if content.is_empty() {
+        // settings.jsonが空 or 存在しない場合は新規作成
+        let new_content = format!(r#"{{"hooks":{{{}}}}}"#, hook_entry);
+        let _ = fs::write(&settings_path, &new_content);
+        return;
+    }
+
+    if !content.contains("\"hooks\"") {
+        // hooksキーがない場合、トップレベルに追加
+        if let Some(pos) = content.find('{') {
+            let insert_pos = pos + 1;
+            let after = content[insert_pos..].trim_start();
+            let comma = if after.starts_with('}') { "" } else { "," };
+            let mut new_content = content[..insert_pos].to_string();
+            new_content.push_str(&format!(r#""hooks":{{{}}}{}"#, hook_entry, comma));
+            new_content.push_str(&content[insert_pos..]);
+            let _ = fs::write(&settings_path, &new_content);
+        }
+        return;
+    }
+
+    if content.contains("\"UserPromptSubmit\"") {
+        // 既にUserPromptSubmitがある場合、hookを追加
+        if let Some(pos) = content.find("\"UserPromptSubmit\"") {
+            // "hooks": [ の直後に追加
+            if let Some(hooks_start) = content[pos..].find("\"hooks\"") {
+                let abs = pos + hooks_start;
+                if let Some(bracket) = content[abs..].find('[') {
+                    let insert_pos = abs + bracket + 1;
+                    let mut new_content = content[..insert_pos].to_string();
+                    let single_hook = format!(r#"{{"type":"command","command":"{}"}}"#, hook_cmd);
+                    new_content.push_str(&single_hook);
+                    new_content.push(',');
+                    new_content.push_str(&content[insert_pos..]);
+                    let _ = fs::write(&settings_path, &new_content);
+                }
+            }
+        }
+    } else {
+        // UserPromptSubmitがない場合、hooks直下に追加
+        if let Some(pos) = content.find("\"hooks\"") {
+            if let Some(brace) = content[pos..].find('{') {
+                let insert_pos = pos + brace + 1;
+                let mut new_content = content[..insert_pos].to_string();
+                new_content.push_str(&hook_entry);
+                // 既存のhookがある場合はカンマ追加
+                let after = content[insert_pos..].trim_start();
+                if !after.starts_with('}') {
+                    new_content.push(',');
+                }
+                new_content.push_str(&content[insert_pos..]);
+                let _ = fs::write(&settings_path, &new_content);
+            }
+        }
+    }
+}
+
 // ハイライト名とカラーのマッピング
 const HIGHLIGHT_NAMES: &[&str] = &[
     "keyword",
@@ -1043,6 +1115,7 @@ impl App {
         // IDE MCPサーバー起動 (WebSocket + ~/.claude/ide/ ロックファイル)
         let workspace_str = app.root_dir.to_string_lossy().to_string();
         app.mcp_port = start_ide_mcp_server(app.shared_state.clone(), &workspace_str);
+        ensure_claude_hook();
 
         // 初期ファイルがあれば開く
         if let Some(file_path) = initial_file {
