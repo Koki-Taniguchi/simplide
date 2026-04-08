@@ -20,21 +20,20 @@
 ## インストール
 
 ```bash
-cargo build --release
-cp ./target/release/simplide ~/.cargo/bin/side
+cargo install --path .
 ```
 
 ## 使い方
 
 ```bash
 # カレントディレクトリで起動
-side
+simplide
 
 # 特定のディレクトリを開く
-side /path/to/directory
+simplide /path/to/directory
 
 # 特定のファイルを開く（親ディレクトリも表示）
-side /path/to/file.rs
+simplide /path/to/file.rs
 ```
 
 ## 操作方法
@@ -170,11 +169,11 @@ side /path/to/file.rs
 
 ### Claude Code連携
 
-sideはClaude Code CLIとIDE統合できます。VS Code拡張と同じ仕組み（WebSocket MCP）を使用。
+simplideはClaude Code CLIとIDE統合できます。VS Code拡張と同じ仕組み（WebSocket MCP）を使用。
 
 #### セットアップ
 
-1. `side`を起動（WebSocket MCPサーバーが自動起動、`~/.claude/ide/`にロックファイル生成）
+1. `simplide`を起動（WebSocket MCPサーバーが自動起動、`~/.claude/ide/`にロックファイル生成）
 2. 別ターミナルで`claude`を起動
 3. `/ide`を実行 → simplideに接続
 
@@ -186,7 +185,7 @@ sideはClaude Code CLIとIDE統合できます。VS Code拡張と同じ仕組み
 
 #### 自動コンテキスト注入
 
-初回`side`起動時に`~/.claude/settings.json`へ`UserPromptSubmit`フックを自動登録。sideが起動中の場合、ユーザーのプロンプト送信時に自動的にエディタ状態の確認を促します。sideが未起動時は何も起きません。
+初回`simplide`起動時に`~/.claude/settings.json`へ`UserPromptSubmit`フックを自動登録。simplideが起動中の場合、ユーザーのプロンプト送信時に自動的にエディタ状態の確認を促します。simplideが未起動時は何も起きません。
 
 ### パフォーマンス
 
