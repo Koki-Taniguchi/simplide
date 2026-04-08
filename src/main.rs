@@ -4,6 +4,8 @@ use std::fs;
 use std::io;
 use std::panic;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 use crossterm::{
@@ -649,6 +651,11 @@ struct App {
     grep_results: Vec<GrepResult>,
     grep_selected: usize,
     grep_scroll: usize,
+    grep_scroll_x: usize,
+    grep_tx: Sender<(String, PathBuf, Arc<AtomicBool>)>,
+    grep_rx: Receiver<Vec<GrepResult>>,
+    grep_cancel: Arc<AtomicBool>,
+    grep_searching: bool,
     // サイドバーボタン位置
     sidebar_filter_btn: Option<Rect>,
     sidebar_grep_btn: Option<Rect>,
@@ -738,6 +745,19 @@ impl App {
             }
         });
 
+        // Grep検索用のワーカースレッドを起動
+        let (grep_tx, grep_rx_worker) = mpsc::channel::<(String, PathBuf, Arc<AtomicBool>)>();
+        let (grep_tx_main, grep_rx) = mpsc::channel::<Vec<GrepResult>>();
+        std::thread::spawn(move || {
+            while let Ok((query, root, cancel)) = grep_rx_worker.recv() {
+                let mut results = Vec::new();
+                App::grep_recursive(&root, &query, &mut results, 500, &cancel);
+                if !cancel.load(Ordering::Relaxed) {
+                    let _ = grep_tx_main.send(results);
+                }
+            }
+        });
+
         let mut app = App {
             root_dir,
             current_dir,
@@ -788,6 +808,11 @@ impl App {
             grep_results: Vec::new(),
             grep_selected: 0,
             grep_scroll: 0,
+            grep_scroll_x: 0,
+            grep_tx,
+            grep_rx,
+            grep_cancel: Arc::new(AtomicBool::new(false)),
+            grep_searching: false,
             sidebar_filter_btn: None,
             sidebar_grep_btn: None,
             selection: None,
@@ -1161,30 +1186,36 @@ impl App {
     }
 
     fn grep_search(&mut self) {
+        // 前回の検索をキャンセル
+        self.grep_cancel.store(true, Ordering::Relaxed);
         self.grep_results.clear();
         self.grep_selected = 0;
         self.grep_scroll = 0;
         if self.grep_query.is_empty() {
+            self.grep_searching = false;
             return;
         }
         let query = self.grep_query.to_lowercase();
         let root = self.root_dir.clone();
-        Self::grep_recursive(&root, &query, &mut self.grep_results, 500);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.grep_cancel = cancel.clone();
+        self.grep_searching = true;
+        let _ = self.grep_tx.send((query, root, cancel));
     }
 
-    fn grep_recursive(dir: &PathBuf, query: &str, results: &mut Vec<GrepResult>, max: usize) {
-        if results.len() >= max { return; }
+    fn grep_recursive(dir: &PathBuf, query: &str, results: &mut Vec<GrepResult>, max: usize, cancel: &AtomicBool) {
+        if results.len() >= max || cancel.load(Ordering::Relaxed) { return; }
         let Ok(rd) = fs::read_dir(dir) else { return; };
         let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
         entries.sort();
         for entry in entries {
-            if results.len() >= max { return; }
+            if results.len() >= max || cancel.load(Ordering::Relaxed) { return; }
             let name = entry.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             if name.starts_with('.') || name == "node_modules" || name == "target" {
                 continue;
             }
             if entry.is_dir() {
-                Self::grep_recursive(&entry, query, results, max);
+                Self::grep_recursive(&entry, query, results, max, cancel);
             } else if entry.is_file() {
                 if let Ok(meta) = fs::metadata(&entry) {
                     if meta.len() > 1_048_576 { continue; }
@@ -2128,6 +2159,14 @@ fn main() -> io::Result<()> {
             }
         }
 
+        // Grep検索完了イベントを受け取る
+        if let Ok(results) = app.grep_rx.try_recv() {
+            app.grep_results = results;
+            app.grep_selected = 0;
+            app.grep_scroll = 0;
+            app.grep_searching = false;
+        }
+
         app.update_scroll();
 
         // 画面クリアが必要な場合
@@ -2518,7 +2557,9 @@ fn main() -> io::Result<()> {
 
                 // 検索バー (上部1行)
                 let search_line = Rect::new(inner_area.x, inner_area.y, inner_area.width, 1);
-                let match_info = if app.grep_results.is_empty() {
+                let match_info = if app.grep_searching {
+                    " (searching...)".to_string()
+                } else if app.grep_results.is_empty() {
                     if app.grep_query.is_empty() { String::new() }
                     else { " (no results)".to_string() }
                 } else {
@@ -2548,7 +2589,13 @@ fn main() -> io::Result<()> {
                     .map(|(i, r)| {
                         let rel = r.path.strip_prefix(&app.root_dir)
                             .unwrap_or(&r.path).to_string_lossy();
-                        let text = format!("{}:{}: {}", rel, r.line_number, r.line_content);
+                        let full_text = format!("{}:{}: {}", rel, r.line_number, r.line_content);
+                        let chars: Vec<char> = full_text.chars().collect();
+                        let text = if app.grep_scroll_x >= chars.len() {
+                            String::new()
+                        } else {
+                            chars[app.grep_scroll_x..].iter().collect()
+                        };
                         let style = if i == app.grep_selected {
                             Style::default().bg(Color::Blue).fg(Color::White)
                         } else {
@@ -2808,6 +2855,14 @@ fn main() -> io::Result<()> {
                                     }
                                     false
                                 }
+                                KeyCode::Left => {
+                                    app.grep_scroll_x = app.grep_scroll_x.saturating_sub(4);
+                                    false
+                                }
+                                KeyCode::Right => {
+                                    app.grep_scroll_x += 4;
+                                    false
+                                }
                                 KeyCode::Enter => {
                                     if let Some(result) = app.grep_results.get(app.grep_selected).cloned() {
                                         app.open_file(&result.path);
@@ -2917,6 +2972,7 @@ fn main() -> io::Result<()> {
                                 app.grep_results.clear();
                                 app.grep_selected = 0;
                                 app.grep_scroll = 0;
+                                app.grep_scroll_x = 0;
                                 false
                             }
                             _ => false,
@@ -3068,6 +3124,7 @@ fn main() -> io::Result<()> {
                                 app.grep_results.clear();
                                 app.grep_selected = 0;
                                 app.grep_scroll = 0;
+                                app.grep_scroll_x = 0;
                             } else if clicked_copy_button {
                                 // コピーボタンクリック：OSC 52でコピーして選択解除
                                 if let Some(text) = app.get_selected_text() {
@@ -3128,14 +3185,18 @@ fn main() -> io::Result<()> {
                             }
                         }
                         MouseEventKind::ScrollLeft => {
-                            if in_sidebar {
+                            if in_grep_overlay {
+                                app.grep_scroll_x = app.grep_scroll_x.saturating_sub(4);
+                            } else if in_sidebar {
                                 app.handle_sidebar_horizontal_scroll(x, y, -2);
                             } else if in_editor {
                                 app.handle_editor_horizontal_scroll(-2);
                             }
                         }
                         MouseEventKind::ScrollRight => {
-                            if in_sidebar {
+                            if in_grep_overlay {
+                                app.grep_scroll_x += 4;
+                            } else if in_sidebar {
                                 app.handle_sidebar_horizontal_scroll(x, y, 2);
                             } else if in_editor {
                                 app.handle_editor_horizontal_scroll(2);
