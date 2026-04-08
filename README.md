@@ -15,6 +15,7 @@
 - **ファイル検索**: ファイル名フィルタ（プロジェクト全体から検索）
 - **全体検索（grep）**: プロジェクト内のテキスト検索、結果クリックで該当行にジャンプ
 - **ファイル内検索**: リアルタイム検索とマッチハイライト
+- **Claude Code連携**: WebSocket MCPサーバーによるIDE統合（`/ide`で接続）
 
 ## インストール
 
@@ -167,9 +168,32 @@ side /path/to/file.rs
 - PNG, JPEG, GIF, WebP形式に対応
 - ターミナル内でプレビュー表示
 
+### Claude Code連携
+
+sideはClaude Code CLIとIDE統合できます。VS Code拡張と同じ仕組み（WebSocket MCP）を使用。
+
+#### セットアップ
+
+1. `side`を起動（WebSocket MCPサーバーが自動起動、`~/.claude/ide/`にロックファイル生成）
+2. 別ターミナルで`claude`を起動
+3. `/ide`を実行 → simplideに接続
+
+#### 提供ツール
+
+| ツール | 内容 |
+|--------|------|
+| `getDiagnostics` | エディタの状態を返す（ファイル、カーソル位置、選択テキスト、表示中コード、タブ一覧） |
+
+#### 自動コンテキスト注入
+
+初回`side`起動時に`~/.claude/settings.json`へ`UserPromptSubmit`フックを自動登録。sideが起動中の場合、ユーザーのプロンプト送信時に自動的にエディタ状態の確認を促します。sideが未起動時は何も起きません。
+
 ### パフォーマンス
 
 - ソース・ハイライトキャッシュ
+- 非同期grep検索（バックグラウンドスレッド + キャンセル機構）
+- 検索マッチのバイナリサーチ
+- 行番号幅のキャッシュ
 - イベントバッチ処理
 - 60fps描画
 
@@ -182,6 +206,8 @@ side /path/to/file.rs
 | Ropey | テキストバッファ管理 |
 | tree-sitter | シンタックスハイライト |
 | ratatui-image | ターミナル画像表示 |
+| tungstenite | WebSocket（Claude Code連携） |
+| uuid | 認証トークン生成 |
 
 ## ライセンス
 
