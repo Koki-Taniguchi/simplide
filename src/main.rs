@@ -717,6 +717,10 @@ impl SyntaxHighlighter {
     }
 }
 
+fn should_skip_dir(name: &str) -> bool {
+    name == ".git" || name == "node_modules" || name == "target" || name.starts_with('.')
+}
+
 fn is_image_file(path: &PathBuf) -> bool {
     matches!(
         path.extension().and_then(|e| e.to_str()).map(|s| s.to_lowercase()).as_deref(),
@@ -868,6 +872,9 @@ struct App {
     is_selecting: bool,
     // コピーボタン表示位置（画面座標）
     copy_button_area: Option<Rect>,
+    // キャッシュ
+    cached_line_number_width: usize,
+    cached_line_count: usize,
     // Claude Code MCP連携
     last_state_write: Instant,
     shared_state: Arc<Mutex<EditorSharedState>>,
@@ -1026,6 +1033,8 @@ impl App {
             selection: None,
             is_selecting: false,
             copy_button_area: None,
+            cached_line_number_width: 2,
+            cached_line_count: 0,
             last_state_write: Instant::now(),
             shared_state: Arc::new(Mutex::new(EditorSharedState::default())),
             mcp_port: None,
@@ -1075,7 +1084,7 @@ impl App {
     fn open_file(&mut self, path: &PathBuf) {
         if path.is_file() {
             // 現在のファイルの状態を保存
-            if let Some(current_path) = &self.file_path.clone() {
+            if let Some(current_path) = self.file_path.clone() {
                 if !self.is_image_mode {
                     if self.is_unsaved() {
                         // 未保存なら保持
@@ -1091,7 +1100,7 @@ impl App {
                         });
                     } else {
                         // 保存済みならメモリから削除
-                        self.unsaved_files.remove(current_path);
+                        self.unsaved_files.remove(&current_path);
                     }
                 }
             }
@@ -1228,7 +1237,8 @@ impl App {
         {
             // クリック位置からタブを特定
             let mut current_x = self.tab_area.x;
-            for path in &self.tabs.clone() {
+            let mut clicked_path = None;
+            for path in &self.tabs {
                 let file_name = path.file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_else(|| "New".to_string());
@@ -1244,12 +1254,14 @@ impl App {
                 let tab_len = tab_text.len() as u16;
 
                 if x >= current_x && x < current_x + tab_len {
-                    // このタブがクリックされた
-                    self.open_file(path);
-                    return;
+                    clicked_path = Some(path.clone());
+                    break;
                 }
 
-                current_x += tab_len + 1; // +1 for space between tabs
+                current_x += tab_len + 1;
+            }
+            if let Some(path) = clicked_path {
+                self.open_file(&path);
             }
         }
     }
@@ -1265,10 +1277,10 @@ impl App {
 
     /// タブを強制的に閉じる（確認なし）
     fn force_close_current_tab(&mut self) {
-        if let Some(current) = &self.file_path.clone() {
-            if let Some(idx) = self.tabs.iter().position(|p| p == current) {
+        if let Some(current) = self.file_path.clone() {
+            if let Some(idx) = self.tabs.iter().position(|p| p == &current) {
                 self.tabs.remove(idx);
-                self.unsaved_files.remove(current);
+                self.unsaved_files.remove(&current);
                 // 別のタブがあれば切り替え
                 if !self.tabs.is_empty() {
                     let new_idx = idx.min(self.tabs.len() - 1);
@@ -1388,7 +1400,7 @@ impl App {
         for entry in entries {
             if results.len() >= max { return; }
             let name = entry.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            if name == ".git" || name == "node_modules" || name == "target" {
+            if should_skip_dir(&name) {
                 continue;
             }
             if name.to_lowercase().contains(query) {
@@ -1426,7 +1438,7 @@ impl App {
         for entry in entries {
             if results.len() >= max || cancel.load(Ordering::Relaxed) { return; }
             let name = entry.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            if name.starts_with('.') || name == "node_modules" || name == "target" {
+            if should_skip_dir(&name) {
                 continue;
             }
             if entry.is_dir() {
@@ -1879,7 +1891,7 @@ impl App {
     }
 
     /// エディタ領域内の座標を行・列に変換
-    fn screen_to_editor_pos(&self, x: u16, y: u16) -> Option<(usize, usize)> {
+    fn screen_to_editor_pos(&mut self, x: u16, y: u16) -> Option<(usize, usize)> {
         let ln_width = self.line_number_width() as u16;
         if x >= self.editor_area.x + 1 + ln_width
             && x < self.editor_area.x + self.editor_area.width - 1
@@ -2151,10 +2163,14 @@ impl App {
         Some((&self.source_cache[start..text_end], start))
     }
 
-    fn line_number_width(&self) -> usize {
-        let total = self.buffer.len_lines().max(1);
-        let digits = (total as f64).log10().floor() as usize + 1;
-        digits + 1 // +1 for space after number
+    fn line_number_width(&mut self) -> usize {
+        let total = self.buffer.len_lines();
+        if total != self.cached_line_count {
+            self.cached_line_count = total;
+            let digits = (total.max(1) as f64).log10().floor() as usize + 1;
+            self.cached_line_number_width = digits + 1;
+        }
+        self.cached_line_number_width
     }
 
     fn get_highlighted_lines(&mut self, visible_height: usize, visible_width: usize) -> Vec<Line<'static>> {
@@ -2176,15 +2192,10 @@ impl App {
                 let ln_span = Span::styled(ln_str, Style::default().fg(Color::DarkGray));
 
                 if let Some((line_text, line_start)) = self.get_line_from_cache(line_idx) {
-                    if let Some(ref colors) = &self.highlight_cache {
-                        let mut spans = vec![ln_span];
-                        spans.extend(self.build_spans_from_colors(line_text, line_start, colors, content_width, line_idx));
-                        lines.push(Line::from(spans));
-                    } else {
-                        let mut spans = vec![ln_span];
-                        spans.extend(self.build_spans_simple(line_text, content_width, line_idx));
-                        lines.push(Line::from(spans));
-                    }
+                    let colors_ref = self.highlight_cache.as_deref();
+                    let mut spans = vec![ln_span];
+                    spans.extend(self.build_spans(line_text, line_start, colors_ref, content_width, line_idx));
+                    lines.push(Line::from(spans));
                 } else {
                     lines.push(Line::from(vec![ln_span]));
                 }
@@ -2203,8 +2214,11 @@ impl App {
             return false;
         }
         let query_len = self.search_query.chars().count();
-        for &(match_line, match_col) in &self.search_matches {
-            if match_line == line_idx && col >= match_col && col < match_col + query_len {
+        // search_matchesはソート済み。バイナリサーチで該当行の開始位置を探す
+        let start = self.search_matches.partition_point(|&(line, _)| line < line_idx);
+        for &(match_line, match_col) in &self.search_matches[start..] {
+            if match_line > line_idx { break; }
+            if col >= match_col && col < match_col + query_len {
                 return true;
             }
         }
@@ -2232,7 +2246,7 @@ impl App {
         }
     }
 
-    fn build_spans_from_colors(&self, line_text: &str, line_start: usize, colors: &[Color], visible_width: usize, line_idx: usize) -> Vec<Span<'static>> {
+    fn build_spans(&self, line_text: &str, line_start: usize, colors: Option<&[Color]>, visible_width: usize, line_idx: usize) -> Vec<Span<'static>> {
         if line_text.is_empty() {
             return vec![];
         }
@@ -2245,93 +2259,32 @@ impl App {
         let mut visible_chars = 0;
 
         for ch in line_text.chars() {
-            let byte_pos = line_start + byte_offset;
-            let fg_color = colors.get(byte_pos).copied().unwrap_or(Color::White);
-
-            // タブは4スペースに展開、その他は表示幅を取得
-            let (display_ch, char_width) = if ch == '\t' {
-                (' ', 4usize)
+            let fg_color = if let Some(c) = colors {
+                let byte_pos = line_start + byte_offset;
+                c.get(byte_pos).copied().unwrap_or(Color::White)
             } else {
-                (ch, ch.width().unwrap_or(1))
+                Color::White
             };
 
-            // 横スクロール範囲内の文字のみ処理
-            if char_index >= self.horizontal_scroll && visible_chars < visible_width {
-                // 表示幅が残り幅を超える場合は終了
-                if visible_chars + char_width > visible_width {
-                    break;
-                }
-
-                // ハイライト優先度: 検索マッチ > 選択範囲 > 通常
-                let style = if self.is_current_match(line_idx, char_index) {
-                    Style::default().fg(Color::Black).bg(Color::Yellow)
-                } else if self.is_in_search_match(line_idx, char_index) {
-                    Style::default().fg(fg_color).bg(Color::DarkGray)
-                } else if self.is_in_selection(line_idx, char_index) {
-                    Style::default().fg(Color::White).bg(Color::Blue)
-                } else {
-                    Style::default().fg(fg_color)
-                };
-
-                if current_style.is_none() {
-                    current_style = Some(style);
-                }
-
-                if Some(style) != current_style {
-                    if !current_text.is_empty() {
-                        result.push(Span::styled(current_text.clone(), current_style.unwrap()));
-                        current_text.clear();
-                    }
-                    current_style = Some(style);
-                }
-                // タブは複数スペースとして追加
-                if ch == '\t' {
-                    for _ in 0..char_width {
-                        current_text.push(' ');
-                    }
-                } else {
-                    current_text.push(display_ch);
-                }
-                visible_chars += char_width;
-            }
-
-            byte_offset += ch.len_utf8();
-            char_index += 1;
-        }
-
-        if !current_text.is_empty() {
-            if let Some(style) = current_style {
-                result.push(Span::styled(current_text, style));
-            }
-        }
-
-        result
-    }
-
-    fn build_spans_simple(&self, line_text: &str, visible_width: usize, line_idx: usize) -> Vec<Span<'static>> {
-        let mut result = Vec::new();
-        let mut current_style: Option<Style> = None;
-        let mut current_text = String::new();
-        let mut char_index = 0;
-        let mut visible_chars = 0;
-
-        for ch in line_text.chars() {
-            // タブは4スペースに展開、その他は表示幅を取得
             let char_width = if ch == '\t' { 4usize } else { ch.width().unwrap_or(1) };
 
             if char_index >= self.horizontal_scroll && visible_chars < visible_width {
-                // 表示幅が残り幅を超える場合は終了
                 if visible_chars + char_width > visible_width {
                     break;
                 }
 
-                // ハイライト優先度: 検索マッチ > 選択範囲 > 通常
                 let style = if self.is_current_match(line_idx, char_index) {
                     Style::default().fg(Color::Black).bg(Color::Yellow)
                 } else if self.is_in_search_match(line_idx, char_index) {
-                    Style::default().bg(Color::DarkGray)
+                    if colors.is_some() {
+                        Style::default().fg(fg_color).bg(Color::DarkGray)
+                    } else {
+                        Style::default().bg(Color::DarkGray)
+                    }
                 } else if self.is_in_selection(line_idx, char_index) {
                     Style::default().fg(Color::White).bg(Color::Blue)
+                } else if colors.is_some() {
+                    Style::default().fg(fg_color)
                 } else {
                     Style::default()
                 };
@@ -2347,7 +2300,7 @@ impl App {
                     }
                     current_style = Some(style);
                 }
-                // タブは複数スペースとして追加
+
                 if ch == '\t' {
                     for _ in 0..char_width {
                         current_text.push(' ');
@@ -2357,6 +2310,8 @@ impl App {
                 }
                 visible_chars += char_width;
             }
+
+            byte_offset += ch.len_utf8();
             char_index += 1;
         }
 
