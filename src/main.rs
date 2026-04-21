@@ -2059,6 +2059,7 @@ impl App {
             end: (last_line, last_col),
         });
         self.is_selecting = false;
+        self.update_copy_button_position();
     }
 
     /// 選択解除
