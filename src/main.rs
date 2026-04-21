@@ -8,7 +8,7 @@ use std::panic;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::{
     event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
@@ -951,6 +951,8 @@ struct App {
     last_state_write: Instant,
     shared_state: Arc<Mutex<EditorSharedState>>,
     mcp_port: Option<u16>,
+    // 外部ファイル変更の定期チェック
+    last_external_check: Instant,
 }
 
 #[derive(Clone)]
@@ -1110,6 +1112,7 @@ impl App {
             last_state_write: Instant::now(),
             shared_state: Arc::new(Mutex::new(EditorSharedState::default())),
             mcp_port: None,
+            last_external_check: Instant::now(),
         };
 
         // IDE MCPサーバー起動 (WebSocket + ~/.claude/ide/ ロックファイル)
@@ -1152,6 +1155,63 @@ impl App {
     /// ファイルの更新日時を取得
     fn get_file_modified_time(path: &PathBuf) -> Option<SystemTime> {
         fs::metadata(path).ok().and_then(|m| m.modified().ok())
+    }
+
+    /// 現在開いているファイルがディスク上で変更されたか定期チェックし、
+    /// 修正中でなければバッファを最新内容で置き換える
+    fn check_external_file_changes(&mut self) {
+        if self.last_external_check.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.last_external_check = Instant::now();
+
+        if self.is_image_mode || self.is_unsaved() {
+            return;
+        }
+        let path = match self.file_path.clone() {
+            Some(p) => p,
+            None => return,
+        };
+        let disk_mtime = match Self::get_file_modified_time(&path) {
+            Some(t) => t,
+            None => return,
+        };
+        if Some(disk_mtime) == self.file_modified_time {
+            return;
+        }
+
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        if content == self.saved_content {
+            self.file_modified_time = Some(disk_mtime);
+            return;
+        }
+
+        self.buffer = Rope::from_str(&content);
+        self.saved_content = content;
+        self.file_modified_time = Some(disk_mtime);
+
+        let line_count = self.buffer.len_lines();
+        if self.cursor_line >= line_count {
+            self.cursor_line = line_count.saturating_sub(1);
+            self.cursor_col = 0;
+        } else {
+            let line_len = self.buffer.line(self.cursor_line)
+                .chars().filter(|&c| c != '\n' && c != '\r').count();
+            if self.cursor_col > line_len {
+                self.cursor_col = line_len;
+            }
+        }
+        self.selection = None;
+        self.copy_button_area = None;
+        self.source_cache.clear();
+        self.highlight_cache = None;
+        self.line_offsets.clear();
+        self.max_line_width = 0;
+        self.buffer_dirty = true;
+        self.needs_clear = true;
     }
 
     fn open_file(&mut self, path: &PathBuf) {
@@ -2442,6 +2502,7 @@ fn main() -> io::Result<()> {
             app.grep_searching = false;
         }
 
+        app.check_external_file_changes();
         app.update_scroll();
         app.update_shared_state();
 
