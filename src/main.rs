@@ -939,8 +939,9 @@ struct App {
     grep_cancel: Arc<AtomicBool>,
     grep_searching: bool,
     // サイドバーボタン位置
-    sidebar_filter_btn: Option<Rect>,
     sidebar_grep_btn: Option<Rect>,
+    // サイドバーフィルタバー位置（常時表示）
+    sidebar_filter_bar: Option<Rect>,
     // テキスト選択
     selection: Option<Selection>,
     is_selecting: bool,
@@ -1105,8 +1106,8 @@ impl App {
             grep_rx,
             grep_cancel: Arc::new(AtomicBool::new(false)),
             grep_searching: false,
-            sidebar_filter_btn: None,
             sidebar_grep_btn: None,
+            sidebar_filter_bar: None,
             selection: None,
             is_selecting: false,
             copy_button_area: None,
@@ -1521,14 +1522,14 @@ impl App {
         } else {
             let query = self.sidebar_filter_query.to_lowercase();
             let mut results = Vec::new();
-            Self::collect_files_recursive(&self.root_dir, &query, &mut results, 500);
+            Self::collect_files_recursive(&self.root_dir, &self.root_dir, &query, &mut results, 500);
             self.filtered_entries = results;
         }
         self.sidebar_scroll = 0;
         self.sidebar_filter_selected = 0;
     }
 
-    fn collect_files_recursive(dir: &PathBuf, query: &str, results: &mut Vec<PathBuf>, max: usize) {
+    fn collect_files_recursive(dir: &PathBuf, root: &PathBuf, query: &str, results: &mut Vec<PathBuf>, max: usize) {
         if results.len() >= max { return; }
         let Ok(rd) = fs::read_dir(dir) else { return; };
         let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
@@ -1536,14 +1537,17 @@ impl App {
         for entry in entries {
             if results.len() >= max { return; }
             let name = entry.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            if should_skip_dir(&name) {
-                continue;
-            }
-            if name.to_lowercase().contains(query) {
+            let skip = should_skip_dir(&name);
+            // 相対パスに対してマッチ（"src/" で src/ 以下のファイルをヒットさせる）
+            let rel = entry.strip_prefix(root).unwrap_or(&entry)
+                .to_string_lossy()
+                .to_lowercase();
+            if rel.contains(query) {
                 results.push(entry.clone());
             }
-            if entry.is_dir() {
-                Self::collect_files_recursive(&entry, query, results, max);
+            // target/.git/node_modules/隠しディレクトリは配下を辿らない
+            if entry.is_dir() && !skip {
+                Self::collect_files_recursive(&entry, root, query, results, max);
             }
         }
     }
@@ -1924,10 +1928,11 @@ impl App {
     }
 
     fn handle_sidebar_click(&mut self, x: u16, y: u16) {
+        // フィルタバー行（下から2番目）はエントリクリックとして扱わない
         if x >= self.sidebar_area.x
             && x < self.sidebar_area.x + self.sidebar_area.width
             && y > self.sidebar_area.y
-            && y < self.sidebar_area.y + self.sidebar_area.height.saturating_sub(1)
+            && y < self.sidebar_area.y + self.sidebar_area.height.saturating_sub(2)
         {
             let was_filter_mode = self.sidebar_filter_mode;
 
@@ -1998,7 +2003,8 @@ impl App {
         {
             let show_parent = self.current_dir != self.root_dir;
             let total_items = self.entries.len() + if show_parent { 1 } else { 0 };
-            let visible_height = self.sidebar_area.height.saturating_sub(2) as usize;
+            // フィルタバー分1行差し引く（常時表示のため）
+            let visible_height = self.sidebar_area.height.saturating_sub(3) as usize;
             let max_scroll = total_items.saturating_sub(visible_height);
 
             if delta < 0 {
@@ -2676,7 +2682,8 @@ fn main() -> io::Result<()> {
                 }
             }).collect();
 
-            let visible_height = chunks[0].height.saturating_sub(2) as usize;
+            // フィルタバー分1行差し引く（常時表示のため）
+            let visible_height = chunks[0].height.saturating_sub(3) as usize;
             let show_parent = app.current_dir != app.root_dir;
             let total_items = entry_lines.len() + if show_parent { 1 } else { 0 };
 
@@ -2762,50 +2769,39 @@ fn main() -> io::Result<()> {
                     .borders(Borders::ALL));
             frame.render_widget(sidebar, chunks[0]);
 
-            // サイドバータイトルバーにボタン描画
+            // サイドバータイトルバーにボタン描画（Gのみ）
             let btn_y = chunks[0].y;
-            let btn_filter_text = " F ";
             let btn_grep_text = " G ";
             let btn_grep_x = chunks[0].x + chunks[0].width.saturating_sub(1 + btn_grep_text.len() as u16);
-            let btn_filter_x = btn_grep_x.saturating_sub(btn_filter_text.len() as u16);
-
-            let filter_btn_area = Rect::new(btn_filter_x, btn_y, btn_filter_text.len() as u16, 1);
             let grep_btn_area = Rect::new(btn_grep_x, btn_y, btn_grep_text.len() as u16, 1);
-            app.sidebar_filter_btn = Some(filter_btn_area);
             app.sidebar_grep_btn = Some(grep_btn_area);
 
-            let filter_btn_style = if app.sidebar_filter_mode {
-                Style::default().bg(Color::Blue).fg(Color::White)
-            } else {
-                Style::default().bg(Color::DarkGray).fg(Color::Cyan)
-            };
             let grep_btn_style = if app.grep_mode {
                 Style::default().bg(Color::Blue).fg(Color::White)
             } else {
                 Style::default().bg(Color::DarkGray).fg(Color::Yellow)
             };
             frame.render_widget(
-                Paragraph::new(btn_filter_text).style(filter_btn_style),
-                filter_btn_area,
-            );
-            frame.render_widget(
                 Paragraph::new(btn_grep_text).style(grep_btn_style),
                 grep_btn_area,
             );
 
-            // サイドバーフィルタバー
-            if app.sidebar_filter_mode {
-                let filter_area = Rect::new(
-                    chunks[0].x + 1,
-                    chunks[0].y + chunks[0].height.saturating_sub(2),
-                    chunks[0].width.saturating_sub(2),
-                    1,
-                );
-                let filter_text = format!("Filter: {}", app.sidebar_filter_query);
-                let filter_bar = Paragraph::new(filter_text)
-                    .style(Style::default().bg(Color::Blue).fg(Color::White));
-                frame.render_widget(filter_bar, filter_area);
-            }
+            // サイドバーフィルタバー（常時表示）
+            let filter_area = Rect::new(
+                chunks[0].x + 1,
+                chunks[0].y + chunks[0].height.saturating_sub(2),
+                chunks[0].width.saturating_sub(2),
+                1,
+            );
+            app.sidebar_filter_bar = Some(filter_area);
+            let filter_text = format!("Filter: {}", app.sidebar_filter_query);
+            let filter_style = if app.sidebar_filter_mode {
+                Style::default().bg(Color::Blue).fg(Color::White)
+            } else {
+                Style::default().bg(Color::DarkGray).fg(Color::Gray)
+            };
+            let filter_bar = Paragraph::new(filter_text).style(filter_style);
+            frame.render_widget(filter_bar, filter_area);
 
             // エディタ
             if app.is_image_mode {
@@ -3437,29 +3433,22 @@ fn main() -> io::Result<()> {
                                 false
                             };
 
-                            // サイドバーボタンのクリック判定
-                            let clicked_filter_btn = if let Some(btn) = app.sidebar_filter_btn {
-                                x >= btn.x && x < btn.x + btn.width && y == btn.y
-                            } else { false };
+                            // サイドバーボタン/フィルタバーのクリック判定
                             let clicked_grep_btn = if let Some(btn) = app.sidebar_grep_btn {
                                 x >= btn.x && x < btn.x + btn.width && y == btn.y
                             } else { false };
+                            let clicked_filter_bar = if let Some(bar) = app.sidebar_filter_bar {
+                                x >= bar.x && x < bar.x + bar.width && y == bar.y
+                            } else { false };
 
-                            // フィルタ/grepモード中、対象外エリアクリックで自動解除
-                            if app.sidebar_filter_mode && !clicked_filter_btn {
-                                // フィルタバー領域内かチェック
-                                let in_filter_bar = {
-                                    let fx = app.sidebar_area.x + 1;
-                                    let fy = app.sidebar_area.y + app.sidebar_area.height.saturating_sub(2);
-                                    let fw = app.sidebar_area.width.saturating_sub(2);
-                                    x >= fx && x < fx + fw && y == fy
-                                };
-                                // サイドバー内のエントリクリックも許可
-                                let in_sidebar = x >= app.sidebar_area.x
+                            // フィルタモード中、対象外エリアクリックで自動解除
+                            if app.sidebar_filter_mode && !clicked_filter_bar {
+                                // サイドバーのエントリ領域（フィルタバー行は除く）
+                                let in_sidebar_entries = x >= app.sidebar_area.x
                                     && x < app.sidebar_area.x + app.sidebar_area.width
                                     && y > app.sidebar_area.y
-                                    && y < app.sidebar_area.y + app.sidebar_area.height.saturating_sub(1);
-                                if !in_filter_bar && !in_sidebar {
+                                    && y < app.sidebar_area.y + app.sidebar_area.height.saturating_sub(2);
+                                if !in_sidebar_entries {
                                     app.sidebar_filter_mode = false;
                                 }
                             }
@@ -3496,12 +3485,14 @@ fn main() -> io::Result<()> {
                                 }
                             }
 
-                            if clicked_filter_btn {
+                            if clicked_filter_bar {
                                 app.grep_mode = false;
-                                app.sidebar_filter_mode = true;
-                                app.sidebar_filter_query.clear();
-                                app.filtered_entries = app.entries.clone();
-                                app.sidebar_filter_selected = 0;
+                                if !app.sidebar_filter_mode {
+                                    app.sidebar_filter_mode = true;
+                                    app.filtered_entries = app.entries.clone();
+                                    app.sidebar_filter_selected = 0;
+                                    app.update_sidebar_filter();
+                                }
                             } else if clicked_grep_btn {
                                 app.sidebar_filter_mode = false;
                                 app.grep_mode = true;
