@@ -895,6 +895,8 @@ struct App {
     file_modified_time: Option<SystemTime>,
     // カーソル追従を有効にするか
     follow_cursor: bool,
+    // 次回のupdate_scrollでカーソル位置を中央に寄せるか（編集イベント時にtrue）
+    center_on_next_update: bool,
     // 現在のファイルの言語
     current_language: Option<Language>,
     // 画像表示用
@@ -1071,6 +1073,7 @@ impl App {
             saved_content: String::new(),
             file_modified_time: None,
             follow_cursor: true,
+            center_on_next_update: false,
             current_language: None,
             picker,
             image_state: None,
@@ -1622,7 +1625,12 @@ impl App {
         }
     }
 
-    /// カーソル位置までの表示幅を計算（全角文字を考慮）
+    /// 1文字の表示幅（タブは4、全角は2、それ以外は1）
+    fn char_display_width(ch: char) -> usize {
+        if ch == '\t' { 4 } else { ch.width().unwrap_or(1) }
+    }
+
+    /// カーソル位置までの表示幅を計算（全角文字・タブを考慮）
     fn cursor_display_col(&self) -> usize {
         if self.cursor_line >= self.buffer.len_lines() {
             return 0;
@@ -1630,7 +1638,7 @@ impl App {
         let line = self.buffer.line(self.cursor_line);
         line.chars()
             .take(self.cursor_col)
-            .map(|c| c.width().unwrap_or(1))
+            .map(Self::char_display_width)
             .sum()
     }
 
@@ -1646,7 +1654,7 @@ impl App {
             if ch == '\n' {
                 break;
             }
-            let ch_width = ch.width().unwrap_or(1);
+            let ch_width = Self::char_display_width(ch);
             if current_width + ch_width > display_col {
                 break;
             }
@@ -1654,6 +1662,17 @@ impl App {
             char_col += 1;
         }
         char_col
+    }
+
+    /// 指定行・指定文字列の位置までの表示幅
+    fn display_col_at(&self, line_idx: usize, char_col: usize) -> usize {
+        if line_idx >= self.buffer.len_lines() {
+            return 0;
+        }
+        self.buffer.line(line_idx).chars()
+            .take(char_col)
+            .map(Self::char_display_width)
+            .sum()
     }
 
     fn clamp_cursor_col(&mut self) {
@@ -1712,6 +1731,7 @@ impl App {
     fn insert_char(&mut self, c: char) {
         self.add_to_tabs();
         self.follow_cursor = true;
+        self.center_on_next_update = true;
         let idx = self.cursor_char_idx();
         self.buffer.insert_char(idx, c);
         self.buffer_dirty = true;
@@ -1726,6 +1746,7 @@ impl App {
     fn delete_char_backspace(&mut self) {
         self.add_to_tabs();
         self.follow_cursor = true;
+        self.center_on_next_update = true;
         let idx = self.cursor_char_idx();
         if idx > 0 {
             let prev_char = self.buffer.char(idx - 1);
@@ -1743,6 +1764,7 @@ impl App {
     fn delete_char_delete(&mut self) {
         self.add_to_tabs();
         self.follow_cursor = true;
+        self.center_on_next_update = true;
         let idx = self.cursor_char_idx();
         if idx < self.buffer.len_chars() {
             self.buffer.remove(idx..idx + 1);
@@ -1763,6 +1785,7 @@ impl App {
     fn kill_line(&mut self) {
         self.add_to_tabs();
         self.follow_cursor = true;
+        self.center_on_next_update = true;
         let line_len = self.current_line_len();
         if self.cursor_col >= line_len {
             // カーソルが行末にある場合、改行を削除（次の行と結合）
@@ -1816,6 +1839,13 @@ impl App {
     /// 終了時に .mcp.json を削除
     fn update_scroll(&mut self) {
         if !self.follow_cursor {
+            self.center_on_next_update = false;
+            return;
+        }
+
+        if self.center_on_next_update {
+            self.center_on_next_update = false;
+            self.center_cursor_both();
             return;
         }
 
@@ -1829,13 +1859,16 @@ impl App {
             }
         }
 
-        // 横スクロール
+        // 横スクロール（表示幅ベース）
         let visible_width = self.editor_area.width.saturating_sub(2) as usize;
-        if visible_width > 0 {
-            if self.cursor_col < self.horizontal_scroll {
-                self.horizontal_scroll = self.cursor_col;
-            } else if self.cursor_col >= self.horizontal_scroll + visible_width {
-                self.horizontal_scroll = self.cursor_col.saturating_sub(visible_width) + 1;
+        let ln_width = self.line_number_width();
+        let content_width = visible_width.saturating_sub(ln_width);
+        if content_width > 0 {
+            let display_col = self.cursor_display_col();
+            if display_col < self.horizontal_scroll {
+                self.horizontal_scroll = display_col;
+            } else if display_col >= self.horizontal_scroll + content_width {
+                self.horizontal_scroll = display_col.saturating_sub(content_width) + 1;
             }
         }
     }
@@ -1845,6 +1878,21 @@ impl App {
         let visible_height = self.editor_area.height.saturating_sub(2) as usize;
         if visible_height > 0 {
             self.scroll_offset = self.cursor_line.saturating_sub(visible_height / 2);
+        }
+    }
+
+    /// カーソルが縦横とも画面中央に来るようスクロール位置を設定
+    fn center_cursor_both(&mut self) {
+        let visible_height = self.editor_area.height.saturating_sub(2) as usize;
+        if visible_height > 0 {
+            self.scroll_offset = self.cursor_line.saturating_sub(visible_height / 2);
+        }
+        let visible_width = self.editor_area.width.saturating_sub(2) as usize;
+        let ln_width = self.line_number_width();
+        let content_width = visible_width.saturating_sub(ln_width);
+        if content_width > 0 {
+            let display_col = self.cursor_display_col();
+            self.horizontal_scroll = display_col.saturating_sub(content_width / 2);
         }
     }
 
@@ -2081,12 +2129,9 @@ impl App {
                 let screen_y = self.editor_area.y + 1 + screen_line as u16;
 
                 // 列位置を計算（表示幅を考慮）
-                let display_col = if end_col >= self.horizontal_scroll {
-                    end_col - self.horizontal_scroll
-                } else {
-                    0
-                };
-                let screen_x = self.editor_area.x + 1 + ln_width as u16 + display_col as u16;
+                let end_display_col = self.display_col_at(end_line, end_col);
+                let visible_end_col = end_display_col.saturating_sub(self.horizontal_scroll);
+                let screen_x = self.editor_area.x + 1 + ln_width as u16 + visible_end_col as u16;
 
                 // ボタンサイズ: [Copy]
                 let button_width = 6u16;
@@ -2169,6 +2214,7 @@ impl App {
             self.cursor_line = start_line;
             self.cursor_col = start_col;
             self.follow_cursor = true;
+            self.center_on_next_update = true;
         }
 
         self.clear_selection();
@@ -2390,6 +2436,7 @@ impl App {
         let mut current_text = String::new();
         let mut byte_offset = 0;
         let mut char_index = 0;
+        let mut display_pos = 0;
         let mut visible_chars = 0;
 
         for ch in line_text.chars() {
@@ -2400,9 +2447,9 @@ impl App {
                 Color::White
             };
 
-            let char_width = if ch == '\t' { 4usize } else { ch.width().unwrap_or(1) };
+            let char_width = Self::char_display_width(ch);
 
-            if char_index >= self.horizontal_scroll && visible_chars < visible_width {
+            if display_pos >= self.horizontal_scroll && visible_chars < visible_width {
                 if visible_chars + char_width > visible_width {
                     break;
                 }
@@ -2447,6 +2494,7 @@ impl App {
 
             byte_offset += ch.len_utf8();
             char_index += 1;
+            display_pos += char_width;
         }
 
         if !current_text.is_empty() {
