@@ -19,6 +19,21 @@
 
 ## インストール
 
+### インストールスクリプト（推奨）
+
+macOS / Linux 用のプリビルドバイナリを `$HOME/.local/bin` に配置します。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Koki-Taniguchi/simplide/main/install.sh | sh
+```
+
+環境変数で挙動を変えられます。
+
+- `SIMPLIDE_VERSION=v0.1.0` 特定バージョン指定
+- `SIMPLIDE_INSTALL_DIR=/usr/local/bin` インストール先変更
+
+### cargo からビルド
+
 ```bash
 cargo install --path .
 ```
