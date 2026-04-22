@@ -20,8 +20,8 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
-    Terminal,
+    widgets::{Block, Borders, Cell, Clear, List, ListItem, Paragraph, Row, Table},
+    Frame, Terminal,
 };
 use ropey::Rope;
 use serde::Deserialize;
@@ -807,6 +807,203 @@ fn decode_image(path: &PathBuf) -> Option<image::DynamicImage> {
         .ok()
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum TableFormat {
+    Csv,
+    Tsv,
+    Xlsx,
+}
+
+fn table_format(path: &PathBuf) -> Option<TableFormat> {
+    let ext = path.extension().and_then(|e| e.to_str())?.to_lowercase();
+    match ext.as_str() {
+        "csv" => Some(TableFormat::Csv),
+        "tsv" => Some(TableFormat::Tsv),
+        "xlsx" | "xlsm" | "xls" | "xlsb" | "ods" => Some(TableFormat::Xlsx),
+        _ => None,
+    }
+}
+
+/// シート1つぶんの表データ
+#[derive(Clone)]
+struct TableSheet {
+    name: String,
+    rows: Vec<Vec<String>>,
+    /// 各列の表示幅(文字数、上限付き)
+    col_widths: Vec<u16>,
+}
+
+const TABLE_CELL_MAX_WIDTH: usize = 40;
+const TABLE_CELL_MIN_WIDTH: usize = 4;
+
+impl TableSheet {
+    fn from_rows(name: String, rows: Vec<Vec<String>>) -> Self {
+        let mut max_cols = 0;
+        for row in &rows {
+            if row.len() > max_cols {
+                max_cols = row.len();
+            }
+        }
+        let mut widths = vec![TABLE_CELL_MIN_WIDTH; max_cols];
+        for row in &rows {
+            for (i, cell) in row.iter().enumerate() {
+                let w = cell.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>();
+                let capped = w.min(TABLE_CELL_MAX_WIDTH);
+                if capped > widths[i] {
+                    widths[i] = capped;
+                }
+            }
+        }
+        Self {
+            name,
+            rows,
+            col_widths: widths.into_iter().map(|w| w as u16).collect(),
+        }
+    }
+
+    fn num_rows(&self) -> usize { self.rows.len() }
+    fn num_cols(&self) -> usize { self.col_widths.len() }
+}
+
+/// 表ファイル(CSV/XLSX)の表示状態
+#[derive(Clone)]
+struct TableView {
+    #[allow(dead_code)] // 将来の書き戻し時に使用
+    format: TableFormat,
+    sheets: Vec<TableSheet>,
+    active_sheet: usize,
+    cursor_row: usize,
+    cursor_col: usize,
+    scroll_row: usize,
+    scroll_col: usize,
+}
+
+impl TableView {
+    fn active(&self) -> &TableSheet {
+        &self.sheets[self.active_sheet]
+    }
+
+    fn clamp_cursor(&mut self) {
+        let rows = self.active().num_rows();
+        let cols = self.active().num_cols();
+        if self.cursor_row >= rows.max(1) { self.cursor_row = rows.saturating_sub(1); }
+        if self.cursor_col >= cols.max(1) { self.cursor_col = cols.saturating_sub(1); }
+    }
+}
+
+fn load_csv_like(path: &PathBuf, delimiter: u8) -> io::Result<TableView> {
+    let bytes = fs::read(path)?;
+    // UTF-8として読み、不正バイトはlossyで受け入れる
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .delimiter(delimiter)
+        .from_reader(text.as_bytes());
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for rec in rdr.records() {
+        match rec {
+            Ok(r) => rows.push(r.iter().map(|s| s.to_string()).collect()),
+            Err(_) => continue,
+        }
+    }
+    let format = if delimiter == b'\t' { TableFormat::Tsv } else { TableFormat::Csv };
+    let sheet_name = path.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Sheet".into());
+    Ok(TableView {
+        format,
+        sheets: vec![TableSheet::from_rows(sheet_name, rows)],
+        active_sheet: 0,
+        cursor_row: 0,
+        cursor_col: 0,
+        scroll_row: 0,
+        scroll_col: 0,
+    })
+}
+
+fn load_xlsx(path: &PathBuf) -> io::Result<TableView> {
+    use calamine::{open_workbook_auto, Data, Reader};
+    let mut wb = open_workbook_auto(path)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{}", e)))?;
+    let names: Vec<String> = wb.sheet_names().to_vec();
+    if names.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "no sheets"));
+    }
+    let mut sheets = Vec::with_capacity(names.len());
+    for name in &names {
+        let mut rows: Vec<Vec<String>> = Vec::new();
+        if let Ok(range) = wb.worksheet_range(name) {
+            for row in range.rows() {
+                let cells: Vec<String> = row.iter().map(|c| match c {
+                    Data::Empty => String::new(),
+                    Data::String(s) => s.clone(),
+                    Data::Float(f) => {
+                        if f.fract() == 0.0 && f.abs() < 1e15 { format!("{}", *f as i64) }
+                        else { format!("{}", f) }
+                    }
+                    Data::Int(i) => format!("{}", i),
+                    Data::Bool(b) => format!("{}", b),
+                    Data::DateTime(d) => format!("{}", d),
+                    Data::DateTimeIso(s) => s.clone(),
+                    Data::DurationIso(s) => s.clone(),
+                    Data::Error(e) => format!("#{:?}", e),
+                }).collect();
+                rows.push(cells);
+            }
+        }
+        sheets.push(TableSheet::from_rows(name.clone(), rows));
+    }
+    Ok(TableView {
+        format: TableFormat::Xlsx,
+        sheets,
+        active_sheet: 0,
+        cursor_row: 0,
+        cursor_col: 0,
+        scroll_row: 0,
+        scroll_col: 0,
+    })
+}
+
+/// 0->A, 25->Z, 26->AA ... のExcel風列名
+fn col_letter(mut n: usize) -> String {
+    let mut s = String::new();
+    loop {
+        let r = n % 26;
+        s.insert(0, (b'A' + r as u8) as char);
+        if n < 26 { break; }
+        n = n / 26 - 1;
+    }
+    s
+}
+
+/// 文字幅ベースで先頭から切り詰め。改行/タブは可視化。
+fn truncate_display(s: &str, max_width: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0;
+    for ch in s.chars() {
+        let ch = match ch {
+            '\n' | '\r' => '↵',
+            '\t' => ' ',
+            c if c.is_control() => '·',
+            c => c,
+        };
+        let cw = ch.width().unwrap_or(0);
+        if w + cw > max_width { break; }
+        out.push(ch);
+        w += cw;
+    }
+    out
+}
+
+fn load_table(path: &PathBuf) -> Option<TableView> {
+    match table_format(path)? {
+        TableFormat::Csv => load_csv_like(path, b',').ok(),
+        TableFormat::Tsv => load_csv_like(path, b'\t').ok(),
+        TableFormat::Xlsx => load_xlsx(path).ok(),
+    }
+}
+
 /// 未保存のファイル状態を保持する構造体
 struct UnsavedFile {
     buffer: Rope,
@@ -910,6 +1107,11 @@ struct App {
     // 画像デコード用スレッド通信
     decode_tx: Sender<(PathBuf, Picker, Sender<(StatefulProtocol, Resize, Rect)>)>,
     decode_rx: Receiver<ThreadProtocol>,
+    // 表ファイル (CSV/XLSX) 表示用
+    table_view: Option<TableView>,
+    is_table_mode: bool,
+    table_cache: HashMap<PathBuf, TableView>,
+    sheet_tab_area: Rect,
     // 未保存ファイルの保持（タブ機能）
     unsaved_files: HashMap<PathBuf, UnsavedFile>,
     // タブ管理
@@ -921,6 +1123,7 @@ struct App {
     search_mode: bool,
     search_query: String,
     search_matches: Vec<(usize, usize)>,  // (line, col)
+    table_search_matches: Vec<(usize, usize, usize)>,  // (sheet, row, col)
     search_index: usize,
     // サイドバー ファイル名フィルタ
     sidebar_filter_mode: bool,
@@ -1084,6 +1287,10 @@ impl App {
             image_rx: rx_main,
             decode_tx,
             decode_rx,
+            table_view: None,
+            is_table_mode: false,
+            table_cache: HashMap::new(),
+            sheet_tab_area: Rect::default(),
             unsaved_files: HashMap::new(),
             tabs: Vec::new(),
             tab_area: Rect::default(),
@@ -1091,6 +1298,7 @@ impl App {
             search_mode: false,
             search_query: String::new(),
             search_matches: Vec::new(),
+            table_search_matches: Vec::new(),
             search_index: 0,
             sidebar_filter_mode: false,
             sidebar_filter_query: String::new(),
@@ -1169,7 +1377,7 @@ impl App {
         }
         self.last_external_check = Instant::now();
 
-        if self.is_image_mode || self.is_unsaved() {
+        if self.is_image_mode || self.is_table_mode || self.is_unsaved() {
             return;
         }
         let path = match self.file_path.clone() {
@@ -1222,7 +1430,11 @@ impl App {
         if path.is_file() {
             // 現在のファイルの状態を保存
             if let Some(current_path) = self.file_path.clone() {
-                if !self.is_image_mode {
+                if self.is_table_mode {
+                    if let Some(tv) = self.table_view.take() {
+                        self.table_cache.insert(current_path.clone(), tv);
+                    }
+                } else if !self.is_image_mode {
                     if self.is_unsaved() {
                         // 未保存なら保持
                         self.unsaved_files.insert(current_path.clone(), UnsavedFile {
@@ -1248,7 +1460,24 @@ impl App {
             // 現在のディスク上のファイルの更新日時を取得
             let current_disk_modified = Self::get_file_modified_time(path);
 
-            if is_image_file(path) {
+            if let Some(view) = table_format(path).and_then(|_|
+                self.table_cache.remove(path).or_else(|| load_table(path))
+            ) {
+                // 表ファイル (CSV/TSV/XLSX)
+                self.table_view = Some(view);
+                self.is_table_mode = true;
+                self.buffer = Rope::new();
+                self.saved_content.clear();
+                self.file_modified_time = current_disk_modified;
+                self.current_language = None;
+                self.image_state = None;
+                self.is_image_mode = false;
+                self.image_loading = false;
+                self.cursor_line = 0;
+                self.cursor_col = 0;
+                self.scroll_offset = 0;
+                self.horizontal_scroll = 0;
+            } else if is_image_file(path) {
                 // 画像ファイルの場合 - 非同期でデコード
                 let _ = self.decode_tx.send((path.clone(), self.picker.clone(), self.image_tx.clone()));
                 self.image_state = None;
@@ -1259,6 +1488,8 @@ impl App {
                 self.saved_content.clear();
                 self.file_modified_time = current_disk_modified;
                 self.current_language = None;
+                self.table_view = None;
+                self.is_table_mode = false;
                 self.cursor_line = 0;
                 self.cursor_col = 0;
                 self.scroll_offset = 0;
@@ -1289,6 +1520,8 @@ impl App {
                 self.image_state = None;
                 self.is_image_mode = false;
                 self.image_loading = false;
+                self.table_view = None;
+                self.is_table_mode = false;
             } else {
                 // ディスクから読み込み
                 let content = fs::read_to_string(path).unwrap_or_else(|_| String::new());
@@ -1299,6 +1532,8 @@ impl App {
                 self.image_state = None;
                 self.is_image_mode = false;
                 self.image_loading = false;
+                self.table_view = None;
+                self.is_table_mode = false;
                 self.cursor_line = 0;
                 self.cursor_col = 0;
                 self.scroll_offset = 0;
@@ -1314,6 +1549,10 @@ impl App {
     }
 
     fn save_file(&mut self) -> io::Result<()> {
+        if self.is_table_mode {
+            // 表モードは現在読み取り専用（保存しない）
+            return Ok(());
+        }
         if let Some(path) = &self.file_path {
             let content = self.buffer.to_string();
             fs::write(path, &content)?;
@@ -1325,7 +1564,282 @@ impl App {
     }
 
     fn is_unsaved(&self) -> bool {
+        if self.is_table_mode {
+            return false;
+        }
         self.buffer.to_string() != self.saved_content
+    }
+
+    /// 表モードのカーソル移動 (dr, dcは符号付き差分)
+    fn table_move(&mut self, dr: i32, dc: i32) {
+        let Some(tv) = self.table_view.as_mut() else { return };
+        let rows = tv.active().num_rows() as i32;
+        let cols = tv.active().num_cols() as i32;
+        if rows == 0 || cols == 0 { return; }
+        let nr = (tv.cursor_row as i32 + dr).clamp(0, rows - 1);
+        let nc = (tv.cursor_col as i32 + dc).clamp(0, cols - 1);
+        tv.cursor_row = nr as usize;
+        tv.cursor_col = nc as usize;
+    }
+
+    /// カーソルのページ単位移動
+    fn table_page(&mut self, dr: i32) {
+        let visible = self.editor_area.height.saturating_sub(3) as i32;
+        let step = visible.max(1);
+        self.table_move(dr * step, 0);
+    }
+
+    fn table_jump_to(&mut self, row: Option<usize>, col: Option<usize>) {
+        let Some(tv) = self.table_view.as_mut() else { return };
+        if let Some(r) = row { tv.cursor_row = r; }
+        if let Some(c) = col { tv.cursor_col = c; }
+        tv.clamp_cursor();
+    }
+
+    /// シート切替 (dir: +1 / -1)
+    fn table_switch_sheet(&mut self, dir: i32) {
+        let Some(tv) = self.table_view.as_mut() else { return };
+        let n = tv.sheets.len() as i32;
+        if n <= 1 { return; }
+        let next = ((tv.active_sheet as i32 + dir).rem_euclid(n)) as usize;
+        tv.active_sheet = next;
+        tv.cursor_row = 0;
+        tv.cursor_col = 0;
+        tv.scroll_row = 0;
+        tv.scroll_col = 0;
+    }
+
+    /// マウス位置からセルをクリック判定
+    fn handle_table_click(&mut self, x: u16, y: u16) {
+        // render_table で計算される可視セル→座標情報を再計算
+        let Some(tv_ref) = self.table_view.as_ref() else { return };
+        let area = self.editor_area;
+        let has_tabs = tv_ref.sheets.len() > 1;
+        let content_height = area.height.saturating_sub(if has_tabs { 1 } else { 0 });
+        let inner_x = area.x + 1;
+        let inner_y = area.y + 1;
+        let inner_w = area.width.saturating_sub(2);
+        let inner_h = content_height.saturating_sub(2);
+        if x < inner_x || x >= inner_x + inner_w || y < inner_y || y >= inner_y + inner_h {
+            return;
+        }
+        let sheet = tv_ref.active();
+        let row_num_width = format!("{}", sheet.num_rows().max(1)).len().max(3) as u16;
+
+        // y=inner_y がヘッダー行
+        let rel_y = y - inner_y;
+        if rel_y == 0 { return; }
+        let row_offset = (rel_y - 1) as usize;
+        let clicked_row = tv_ref.scroll_row + row_offset;
+        if clicked_row >= sheet.num_rows() { return; }
+
+        // x方向: row_num_width 分が行番号、以降が可視列
+        let rel_x = x - inner_x;
+        if rel_x < row_num_width { return; }
+        let mut used = row_num_width + 1; // column_spacing(1)
+        let mut clicked_col: Option<usize> = None;
+        for col_idx in tv_ref.scroll_col..sheet.num_cols() {
+            let w = sheet.col_widths[col_idx].max(3);
+            if rel_x >= used && rel_x < used + w {
+                clicked_col = Some(col_idx);
+                break;
+            }
+            used += w + 1; // + column_spacing
+            if used >= inner_w { break; }
+        }
+        if let Some(c) = clicked_col {
+            self.table_jump_to(Some(clicked_row), Some(c));
+        }
+    }
+
+    /// シートタブ行のクリックを処理
+    fn handle_sheet_tab_click(&mut self, x: u16, y: u16) {
+        let rect = self.sheet_tab_area;
+        if rect.width == 0 { return; }
+        if y != rect.y { return; }
+        if x < rect.x || x >= rect.x + rect.width { return; }
+        let Some(tv) = self.table_view.as_mut() else { return };
+        let mut cursor_x = rect.x;
+        for (i, sh) in tv.sheets.iter().enumerate() {
+            let label_w = format!(" {} ", sh.name).chars()
+                .map(|c| c.width().unwrap_or(0) as u16).sum::<u16>();
+            if x >= cursor_x && x < cursor_x + label_w {
+                tv.active_sheet = i;
+                tv.cursor_row = 0;
+                tv.cursor_col = 0;
+                tv.scroll_row = 0;
+                tv.scroll_col = 0;
+                return;
+            }
+            cursor_x += label_w + 1; // + 区切りスペース
+            if cursor_x >= rect.x + rect.width { break; }
+        }
+    }
+
+    /// 表ビューをフレームに描画し、scroll_row/scroll_col を可視範囲に追従させる
+    fn render_table(&mut self, frame: &mut Frame, area: Rect) {
+        let has_sheets = self.table_view.as_ref().map(|tv| tv.sheets.len() > 1).unwrap_or(false);
+        let has_tabs = has_sheets;
+        let has_search = self.search_mode;
+
+        // area を 内容/シートタブ/検索バー に分割
+        let mut constraints: Vec<Constraint> = vec![Constraint::Min(0)];
+        if has_tabs { constraints.push(Constraint::Length(1)); }
+        if has_search { constraints.push(Constraint::Length(1)); }
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(area);
+        let content_area = chunks[0];
+        let mut next = 1usize;
+        let tab_rect = if has_tabs { let r = chunks[next]; next += 1; Some(r) } else { None };
+        let search_rect = if has_search { Some(chunks[next]) } else { None };
+
+        let Some(tv) = self.table_view.as_mut() else { return };
+
+        let title = format!(
+            "{} [{}]  [↑↓←→:Move Tab:Sheet C-c:Copy Cell C-S-f:Find C-w:Close]",
+            self.file_path.as_ref()
+                .and_then(|p| p.file_name()).map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            tv.active().name,
+        );
+        let block = Block::default().title(title).borders(Borders::ALL);
+        let inner = block.inner(content_area);
+        frame.render_widget(block, content_area);
+
+        if inner.width == 0 || inner.height == 0 {
+            self.sheet_tab_area = tab_rect.unwrap_or_default();
+            return;
+        }
+
+        let sheet = &tv.sheets[tv.active_sheet];
+        let row_num_width = format!("{}", sheet.num_rows().max(1)).len().max(3) as u16;
+
+        // カーソル列が見えるように scroll_col 調整
+        let inner_w = inner.width as i32;
+        let spacing: i32 = 1;
+        // scroll_col がカーソルより右なら戻す
+        if tv.cursor_col < tv.scroll_col {
+            tv.scroll_col = tv.cursor_col;
+        }
+        // カーソルが右に見切れていたら scroll_col を増やす
+        loop {
+            let mut used = row_num_width as i32 + spacing;
+            let mut last_visible = tv.scroll_col;
+            for col_idx in tv.scroll_col..sheet.num_cols() {
+                let w = sheet.col_widths[col_idx].max(3) as i32;
+                if used + w > inner_w { break; }
+                used += w + spacing;
+                last_visible = col_idx;
+            }
+            if tv.cursor_col <= last_visible || tv.scroll_col >= tv.cursor_col { break; }
+            tv.scroll_col += 1;
+        }
+
+        // 可視列を決定
+        let mut visible_cols: Vec<usize> = Vec::new();
+        let mut used = row_num_width as i32 + spacing;
+        for col_idx in tv.scroll_col..sheet.num_cols() {
+            let w = sheet.col_widths[col_idx].max(3) as i32;
+            if used + w > inner_w { break; }
+            visible_cols.push(col_idx);
+            used += w + spacing;
+        }
+        if visible_cols.is_empty() && sheet.num_cols() > tv.scroll_col {
+            visible_cols.push(tv.scroll_col);
+        }
+
+        // 可視行数を決定してスクロール追従
+        let visible_rows = inner.height.saturating_sub(1) as usize; // ヘッダー行を除く
+        if tv.cursor_row < tv.scroll_row {
+            tv.scroll_row = tv.cursor_row;
+        }
+        if visible_rows > 0 && tv.cursor_row >= tv.scroll_row + visible_rows {
+            tv.scroll_row = tv.cursor_row + 1 - visible_rows;
+        }
+
+        // ヘッダー行（A, B, C, ...）
+        let mut header_cells: Vec<Cell> = Vec::with_capacity(visible_cols.len() + 1);
+        header_cells.push(Cell::from("#").style(Style::default().fg(Color::DarkGray)));
+        for &c in &visible_cols {
+            let label = col_letter(c);
+            let w = sheet.col_widths[c].max(3) as usize;
+            header_cells.push(Cell::from(truncate_display(&label, w))
+                .style(Style::default().fg(Color::Yellow)));
+        }
+        let header = Row::new(header_cells).style(Style::default().bg(Color::Rgb(40, 40, 40)));
+
+        // データ行
+        let mut table_rows: Vec<Row> = Vec::with_capacity(visible_rows);
+        for row_idx in tv.scroll_row..sheet.num_rows() {
+            if table_rows.len() >= visible_rows { break; }
+            let mut cells: Vec<Cell> = Vec::with_capacity(visible_cols.len() + 1);
+            cells.push(Cell::from(format!("{}", row_idx + 1))
+                .style(Style::default().fg(Color::DarkGray)));
+            for &c in &visible_cols {
+                let raw = sheet.rows.get(row_idx).and_then(|r| r.get(c))
+                    .map(|s| s.as_str()).unwrap_or("");
+                let w = sheet.col_widths[c].max(3) as usize;
+                let text = truncate_display(raw, w);
+                let is_cursor = row_idx == tv.cursor_row && c == tv.cursor_col;
+                let cell = if is_cursor {
+                    Cell::from(text).style(Style::default().bg(Color::Blue).fg(Color::White))
+                } else {
+                    Cell::from(text)
+                };
+                cells.push(cell);
+            }
+            table_rows.push(Row::new(cells));
+        }
+
+        let mut widths: Vec<Constraint> = Vec::with_capacity(visible_cols.len() + 1);
+        widths.push(Constraint::Length(row_num_width));
+        for &c in &visible_cols {
+            widths.push(Constraint::Length(sheet.col_widths[c].max(3)));
+        }
+
+        let table = Table::new(table_rows, widths)
+            .header(header)
+            .column_spacing(1);
+        frame.render_widget(table, inner);
+
+        // シートタブ
+        if let Some(tab_rect) = tab_rect {
+            let mut spans: Vec<Span> = Vec::new();
+            for (i, sh) in tv.sheets.iter().enumerate() {
+                let label = format!(" {} ", sh.name);
+                let style = if i == tv.active_sheet {
+                    Style::default().bg(Color::Blue).fg(Color::White)
+                } else {
+                    Style::default().bg(Color::DarkGray).fg(Color::Gray)
+                };
+                spans.push(Span::styled(label, style));
+                spans.push(Span::raw(" "));
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), tab_rect);
+            self.sheet_tab_area = tab_rect;
+        } else {
+            self.sheet_tab_area = Rect::default();
+        }
+
+        // 検索バー
+        if let Some(search_rect) = search_rect {
+            let total = self.table_search_matches.len();
+            let match_info = if total == 0 {
+                if self.search_query.is_empty() { String::new() } else { " (no match)".to_string() }
+            } else {
+                format!(" ({}/{} across sheets)", self.search_index + 1, total)
+            };
+            let text = format!("Search: {}{}", self.search_query, match_info);
+            frame.render_widget(
+                Paragraph::new(text).style(Style::default().bg(Color::DarkGray).fg(Color::White)),
+                search_rect,
+            );
+            let cx = (search_rect.x + 8 + self.search_query.len() as u16)
+                .min(search_rect.x + search_rect.width.saturating_sub(1));
+            frame.set_cursor_position((cx, search_rect.y));
+        }
     }
 
     /// 現在のファイルをタブに追加（まだなければ）
@@ -1418,6 +1932,7 @@ impl App {
             if let Some(idx) = self.tabs.iter().position(|p| p == &current) {
                 self.tabs.remove(idx);
                 self.unsaved_files.remove(&current);
+                self.table_cache.remove(&current);
                 // 別のタブがあれば切り替え
                 if !self.tabs.is_empty() {
                     let new_idx = idx.min(self.tabs.len() - 1);
@@ -1437,6 +1952,8 @@ impl App {
                     self.cursor_col = 0;
                     self.scroll_offset = 0;
                     self.horizontal_scroll = 0;
+                    self.table_view = None;
+                    self.is_table_mode = false;
                     self.needs_clear = true;
                 }
             }
@@ -1446,9 +1963,33 @@ impl App {
     /// 検索を実行してマッチ位置を更新
     fn search(&mut self) {
         self.search_matches.clear();
+        self.table_search_matches.clear();
         self.search_index = 0;
 
         if self.search_query.is_empty() {
+            return;
+        }
+
+        if self.is_table_mode {
+            let Some(tv) = self.table_view.as_ref() else { return };
+            let q = self.search_query.to_lowercase();
+            for (si, sheet) in tv.sheets.iter().enumerate() {
+                for (ri, row) in sheet.rows.iter().enumerate() {
+                    for (ci, cell) in row.iter().enumerate() {
+                        if cell.to_lowercase().contains(&q) {
+                            self.table_search_matches.push((si, ri, ci));
+                        }
+                    }
+                }
+            }
+            // 現在のアクティブシート・カーソル位置以降を優先
+            let cur = (tv.active_sheet, tv.cursor_row, tv.cursor_col);
+            for (i, &m) in self.table_search_matches.iter().enumerate() {
+                if m >= cur {
+                    self.search_index = i;
+                    break;
+                }
+            }
             return;
         }
 
@@ -1485,30 +2026,46 @@ impl App {
         }
     }
 
+    fn match_count(&self) -> usize {
+        if self.is_table_mode { self.table_search_matches.len() } else { self.search_matches.len() }
+    }
+
+    /// 現在のセル値 (表モードのみ)
+    fn current_cell_value(&self) -> Option<String> {
+        let tv = self.table_view.as_ref()?;
+        let sheet = tv.active();
+        sheet.rows.get(tv.cursor_row).and_then(|r| r.get(tv.cursor_col)).cloned()
+    }
+
     /// 次のマッチに移動
     fn next_match(&mut self) {
-        if self.search_matches.is_empty() {
-            return;
-        }
-        self.search_index = (self.search_index + 1) % self.search_matches.len();
+        let n = self.match_count();
+        if n == 0 { return; }
+        self.search_index = (self.search_index + 1) % n;
         self.jump_to_match();
     }
 
     /// 前のマッチに移動
     fn prev_match(&mut self) {
-        if self.search_matches.is_empty() {
-            return;
-        }
-        if self.search_index == 0 {
-            self.search_index = self.search_matches.len() - 1;
-        } else {
-            self.search_index -= 1;
-        }
+        let n = self.match_count();
+        if n == 0 { return; }
+        self.search_index = if self.search_index == 0 { n - 1 } else { self.search_index - 1 };
         self.jump_to_match();
     }
 
     /// 現在のマッチ位置にジャンプ
     fn jump_to_match(&mut self) {
+        if self.is_table_mode {
+            if let Some(&(si, r, c)) = self.table_search_matches.get(self.search_index) {
+                if let Some(tv) = self.table_view.as_mut() {
+                    tv.active_sheet = si;
+                    tv.cursor_row = r;
+                    tv.cursor_col = c;
+                    tv.clamp_cursor();
+                }
+            }
+            return;
+        }
         if let Some(&(line, col)) = self.search_matches.get(self.search_index) {
             self.cursor_line = line;
             self.cursor_col = col;
@@ -2823,6 +3380,8 @@ fn main() -> io::Result<()> {
                         frame.render_stateful_widget(image_widget, inner, image_state);
                     }
                 }
+            } else if app.is_table_mode {
+                app.render_table(frame, editor_area);
             } else {
                 // テキストモード
                 let visible_height = editor_area.height.saturating_sub(2) as usize;
@@ -3072,6 +3631,7 @@ fn main() -> io::Result<()> {
                                     // Ctrl+C: 検索終了
                                     app.search_mode = false;
                                     app.search_matches.clear();
+                                    app.table_search_matches.clear();
                                     false
                                 }
                                 _ => false,
@@ -3081,6 +3641,7 @@ fn main() -> io::Result<()> {
                                 KeyCode::Esc => {
                                     app.search_mode = false;
                                     app.search_matches.clear();
+                                    app.table_search_matches.clear();
                                     false
                                 }
                                 KeyCode::Enter => {
@@ -3269,6 +3830,15 @@ fn main() -> io::Result<()> {
                     {
                         let _ = app.save_file();
                         false
+                    // 表モード: Cmd+C / Ctrl+C でカーソルセルの値をコピー
+                    } else if app.is_table_mode
+                        && (key.modifiers.contains(KeyModifiers::SUPER) || key.modifiers.contains(KeyModifiers::CONTROL))
+                        && key.code == KeyCode::Char('c')
+                    {
+                        if let Some(text) = app.current_cell_value() {
+                            app.copy_to_clipboard_osc52(&text);
+                        }
+                        false
                     // Command-C (macOS) でコピー
                     } else if key.modifiers.contains(KeyModifiers::SUPER) && key.code == KeyCode::Char('c') {
                         if let Some(text) = app.get_selected_text() {
@@ -3310,6 +3880,7 @@ fn main() -> io::Result<()> {
                                     app.search_mode = true;
                                     app.search_query.clear();
                                     app.search_matches.clear();
+                                    app.table_search_matches.clear();
                                 } else {
                                     // Ctrl+F: カーソルを右に移動 (emacs forward-char)
                                     app.clear_selection();
@@ -3370,6 +3941,25 @@ fn main() -> io::Result<()> {
                             }
                             KeyCode::Up => app.scroll_offset = app.scroll_offset.saturating_sub(5),
                             KeyCode::Down => app.scroll_offset += 5,
+                            _ => {}
+                        }
+                        false
+                    } else if app.is_table_mode {
+                        match key.code {
+                            KeyCode::Up => app.table_move(-1, 0),
+                            KeyCode::Down => app.table_move(1, 0),
+                            KeyCode::Left => app.table_move(0, -1),
+                            KeyCode::Right => app.table_move(0, 1),
+                            KeyCode::PageUp => app.table_page(-1),
+                            KeyCode::PageDown => app.table_page(1),
+                            KeyCode::Home => app.table_jump_to(None, Some(0)),
+                            KeyCode::End => {
+                                let last = app.table_view.as_ref()
+                                    .map(|tv| tv.active().num_cols().saturating_sub(1));
+                                if let Some(c) = last { app.table_jump_to(None, Some(c)); }
+                            }
+                            KeyCode::Tab => app.table_switch_sheet(1),
+                            KeyCode::BackTab => app.table_switch_sheet(-1),
                             _ => {}
                         }
                         false
@@ -3510,15 +4100,22 @@ fn main() -> io::Result<()> {
                             } else if !in_grep_overlay {
                                 app.handle_tab_click(x, y);
                                 app.handle_sidebar_click(x, y);
-                                // エディタ領域でのクリックは選択開始
+                                // エディタ領域でのクリック
                                 if in_editor {
-                                    // 既存の選択を解除
-                                    app.clear_selection();
-                                    // クリック位置にカーソル移動
-                                    app.handle_editor_click(x, y);
-                                    // 選択開始
-                                    if let Some((line, col)) = app.screen_to_editor_pos(x, y) {
-                                        app.start_selection(line, col);
+                                    if app.is_table_mode {
+                                        // シートタブ上ならシート切替、それ以外はセル選択
+                                        if app.sheet_tab_area.width > 0 && y == app.sheet_tab_area.y {
+                                            app.handle_sheet_tab_click(x, y);
+                                        } else {
+                                            app.handle_table_click(x, y);
+                                        }
+                                    } else {
+                                        // 既存の選択を解除してクリック位置にカーソル移動
+                                        app.clear_selection();
+                                        app.handle_editor_click(x, y);
+                                        if let Some((line, col)) = app.screen_to_editor_pos(x, y) {
+                                            app.start_selection(line, col);
+                                        }
                                     }
                                 } else {
                                     app.clear_selection();
@@ -3546,7 +4143,11 @@ fn main() -> io::Result<()> {
                             } else if in_sidebar {
                                 app.handle_sidebar_scroll(x, y, -1);
                             } else if in_editor {
-                                app.handle_editor_scroll(-1);
+                                if app.is_table_mode {
+                                    app.table_move(-1, 0);
+                                } else {
+                                    app.handle_editor_scroll(-1);
+                                }
                             }
                         }
                         MouseEventKind::ScrollDown => {
@@ -3557,7 +4158,11 @@ fn main() -> io::Result<()> {
                             } else if in_sidebar {
                                 app.handle_sidebar_scroll(x, y, 1);
                             } else if in_editor {
-                                app.handle_editor_scroll(1);
+                                if app.is_table_mode {
+                                    app.table_move(1, 0);
+                                } else {
+                                    app.handle_editor_scroll(1);
+                                }
                             }
                         }
                         MouseEventKind::ScrollLeft => {
@@ -3566,7 +4171,11 @@ fn main() -> io::Result<()> {
                             } else if in_sidebar {
                                 app.handle_sidebar_horizontal_scroll(x, y, -2);
                             } else if in_editor {
-                                app.handle_editor_horizontal_scroll(-2);
+                                if app.is_table_mode {
+                                    app.table_move(0, -1);
+                                } else {
+                                    app.handle_editor_horizontal_scroll(-2);
+                                }
                             }
                         }
                         MouseEventKind::ScrollRight => {
@@ -3575,7 +4184,11 @@ fn main() -> io::Result<()> {
                             } else if in_sidebar {
                                 app.handle_sidebar_horizontal_scroll(x, y, 2);
                             } else if in_editor {
-                                app.handle_editor_horizontal_scroll(2);
+                                if app.is_table_mode {
+                                    app.table_move(0, 1);
+                                } else {
+                                    app.handle_editor_horizontal_scroll(2);
+                                }
                             }
                         }
                         _ => {}
@@ -3584,9 +4197,11 @@ fn main() -> io::Result<()> {
                 }
                 Event::Paste(text) => {
                     // ペーストされたテキストを挿入
-                    app.clear_selection();
-                    for c in text.chars() {
-                        app.insert_char(c);
+                    if !app.is_table_mode {
+                        app.clear_selection();
+                        for c in text.chars() {
+                            app.insert_char(c);
+                        }
                     }
                     false
                 }
